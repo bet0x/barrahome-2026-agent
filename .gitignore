@@ -32,3 +32,6 @@ go.work.sum
 # .vscode/
 tmp/
 /barrahome-agent
+
+# Superpowers/SDD scratch: ledgers, briefs, reports. Never commit.
+.superpowers/

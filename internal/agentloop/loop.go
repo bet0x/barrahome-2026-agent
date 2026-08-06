@@ -17,6 +17,10 @@ You may chat about general topics. When a question concerns this site — its
 posts, the CV, the projects page — use your tools to read the actual content
 instead of guessing, and say plainly when something is not there.
 
+If a question is not about this site's content, answer from your own
+knowledge directly instead of searching. If one or two searches turn up
+nothing relevant, say so plainly rather than trying more searches.
+
 Tools available:
 - list_dir(path): list a directory, relative to the content root ("" is the root)
 - read_file(path): read a file, relative to the content root
@@ -104,6 +108,10 @@ func ToolSchemas() []moonshot.ToolDef {
 // model, executes any tool calls it asks for, feeds the results back, and
 // repeats until the model answers with text. It returns the updated history
 // (without the system prompt, which is prepended fresh on each request).
+//
+// If the model is still requesting tools once MaxToolRounds is spent, Run
+// makes one last call with no tools offered, forcing a prose answer from
+// whatever context was already gathered, rather than failing the turn.
 func Run(
 	ctx context.Context,
 	deps Deps,
@@ -119,12 +127,7 @@ func Run(
 	convo = append(convo, moonshot.Message{Role: "user", Content: userMessage})
 
 	for round := 0; round < deps.MaxToolRounds; round++ {
-		upstream := append([]moonshot.Message{{Role: "system", Content: SystemPrompt}}, convo...)
-
-		assistant, err := deps.Model.Stream(ctx, upstream, ToolSchemas(), deps.MaxTokens,
-			func(chunk string) error {
-				return emit(Event{Kind: EventText, Text: chunk})
-			})
+		assistant, err := streamTurn(ctx, deps, convo, ToolSchemas(), emit)
 		if err != nil {
 			return nil, err
 		}
@@ -154,5 +157,26 @@ func Run(
 			})
 		}
 	}
-	return nil, fmt.Errorf("agentloop: gave up after %d tool rounds", deps.MaxToolRounds)
+
+	assistant, err := streamTurn(ctx, deps, convo, nil, emit)
+	if err != nil {
+		return nil, err
+	}
+	return append(convo, *assistant), nil
+}
+
+// streamTurn sends convo upstream with a fresh system prompt and the given
+// tools (nil to force a prose-only answer), streaming text deltas through emit.
+func streamTurn(
+	ctx context.Context,
+	deps Deps,
+	convo []moonshot.Message,
+	tools []moonshot.ToolDef,
+	emit Emit,
+) (*moonshot.Message, error) {
+	upstream := append([]moonshot.Message{{Role: "system", Content: SystemPrompt}}, convo...)
+	return deps.Model.Stream(ctx, upstream, tools, deps.MaxTokens,
+		func(chunk string) error {
+			return emit(Event{Kind: EventText, Text: chunk})
+		})
 }

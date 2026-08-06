@@ -11,14 +11,16 @@ import (
 
 // fakeModel replays scripted assistant turns and records what it was sent.
 type fakeModel struct {
-	turns []*moonshot.Message
-	calls int
-	seen  [][]moonshot.Message
+	turns     []*moonshot.Message
+	calls     int
+	seen      [][]moonshot.Message
+	toolsSeen [][]moonshot.ToolDef
 }
 
 func (f *fakeModel) Stream(_ context.Context, msgs []moonshot.Message,
-	_ []moonshot.ToolDef, _ int, onText func(string) error) (*moonshot.Message, error) {
+	tools []moonshot.ToolDef, _ int, onText func(string) error) (*moonshot.Message, error) {
 	f.seen = append(f.seen, append([]moonshot.Message(nil), msgs...))
+	f.toolsSeen = append(f.toolsSeen, tools)
 	turn := f.turns[min(f.calls, len(f.turns)-1)]
 	f.calls++
 	if turn.Content != "" && onText != nil {
@@ -27,6 +29,38 @@ func (f *fakeModel) Stream(_ context.Context, msgs []moonshot.Message,
 		}
 	}
 	return turn, nil
+}
+
+// alwaysToolCallModel requests a tool call on every turn where tools are
+// offered. It only answers in prose once tools is empty, mirroring a real
+// model that has nothing left to call — this is what makes the graceful-exit
+// behavior in Run testable without special-casing round counts in the fake.
+type alwaysToolCallModel struct {
+	calls     int
+	toolsSeen [][]moonshot.ToolDef
+}
+
+func (m *alwaysToolCallModel) Stream(_ context.Context, _ []moonshot.Message,
+	tools []moonshot.ToolDef, _ int, onText func(string) error) (*moonshot.Message, error) {
+	m.calls++
+	m.toolsSeen = append(m.toolsSeen, tools)
+	if len(tools) == 0 {
+		msg := &moonshot.Message{Role: "assistant", Content: "No encontré nada relacionado."}
+		if onText != nil {
+			if err := onText(msg.Content); err != nil {
+				return nil, err
+			}
+		}
+		return msg, nil
+	}
+	return &moonshot.Message{
+		Role: "assistant",
+		ToolCalls: []moonshot.ToolCall{{
+			ID:       fmt.Sprintf("call_%d", m.calls),
+			Type:     "function",
+			Function: moonshot.ToolCallFunc{Name: "search_content", Arguments: `{"query":"x"}`},
+		}},
+	}, nil
 }
 
 type fakeTools struct{ calls []string }
@@ -128,24 +162,32 @@ func TestRunExecutesToolCallsAndFeedsResultsBack(t *testing.T) {
 }
 
 func TestRunStopsAtMaxToolRounds(t *testing.T) {
-	// A model that always asks for another tool call must not loop forever.
-	model := &fakeModel{turns: []*moonshot.Message{{
-		Role: "assistant",
-		ToolCalls: []moonshot.ToolCall{{
-			ID:       "call_x",
-			Type:     "function",
-			Function: moonshot.ToolCallFunc{Name: "list_dir", Arguments: `{"path":""}`},
-		}},
-	}}}
+	// A model that always asks for another tool call must not loop forever:
+	// once the round budget is spent, Run must force a final answer instead
+	// of failing the turn.
+	model := &alwaysToolCallModel{}
 	tools := &fakeTools{}
 
-	if _, err := Run(context.Background(),
+	history, err := Run(context.Background(),
 		Deps{Model: model, Tools: tools, MaxTokens: 512, MaxToolRounds: 3},
-		nil, "loop", func(Event) error { return nil }); err == nil {
-		t.Fatal("Run should fail once MaxToolRounds is exhausted")
+		nil, "loop", func(Event) error { return nil })
+	if err != nil {
+		t.Fatalf("Run: %v, want a graceful final answer instead of an error", err)
 	}
 	if len(tools.calls) > 3 {
 		t.Errorf("tool executed %d times, want at most MaxToolRounds=3", len(tools.calls))
+	}
+	if got := history[len(history)-1].Content; got != "No encontré nada relacionado." {
+		t.Errorf("final history entry = %+v, want the forced prose answer", history[len(history)-1])
+	}
+	// The final call, made once the round budget is exhausted, must offer no
+	// tools — that's what guarantees the model has to answer rather than
+	// merely being asked nicely to.
+	if last := model.toolsSeen[len(model.toolsSeen)-1]; last != nil {
+		t.Errorf("final upstream call tools = %v, want nil", last)
+	}
+	if model.calls != 4 {
+		t.Errorf("model called %d times, want 3 tool rounds plus 1 final answer", model.calls)
 	}
 }
 

@@ -162,16 +162,26 @@ func (d Deps) originAllowed(origin string) bool {
 	return false
 }
 
-// clientIP prefers the left-most X-Forwarded-For entry, since nginx (behind
-// Caddy) is what actually talks to this process.
+// clientIP is the key the per-IP quota is counted against, so a visitor must
+// not be able to choose it. X-Forwarded-For is never consulted: its left-most
+// entry is whatever the client sent, and nginx passes that through. X-Real-IP
+// is trusted only when the immediate peer is loopback, which is the only case
+// where the header can have come from our own nginx.
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if first := strings.TrimSpace(strings.Split(xff, ",")[0]); first != "" {
-			return first
+	host := remoteHost(r)
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		if real := net.ParseIP(strings.TrimSpace(r.Header.Get("X-Real-IP"))); real != nil {
+			return real.String()
 		}
 	}
+	return host
+}
+
+// remoteHost is r.RemoteAddr without its port, tolerating an address that has
+// no port at all (httptest and some listeners).
+func remoteHost(r *http.Request) string {
 	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
 		return host
 	}
-	return r.RemoteAddr
+	return strings.TrimSpace(r.RemoteAddr)
 }

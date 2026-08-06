@@ -128,6 +128,92 @@ func TestStreamRejectsBadRequests(t *testing.T) {
 	}
 }
 
+// TestClientIPIgnoresForgedHeaders is the regression for the quota bypass: a
+// visitor could pick their own rate-limit bucket with one X-Forwarded-For.
+func TestClientIPIgnoresForgedHeaders(t *testing.T) {
+	cases := []struct {
+		name       string
+		remoteAddr string
+		headers    map[string]string
+		want       string
+	}{
+		{
+			name:       "loopback peer with X-Real-IP",
+			remoteAddr: "127.0.0.1:54321",
+			headers:    map[string]string{"X-Real-IP": "198.51.100.7"},
+			want:       "198.51.100.7",
+		},
+		{
+			name:       "loopback peer with forged X-Forwarded-For only",
+			remoteAddr: "127.0.0.1:54321",
+			headers:    map[string]string{"X-Forwarded-For": "9.9.9.1, 10.0.0.1"},
+			want:       "127.0.0.1",
+		},
+		{
+			name:       "non-loopback peer sending both headers",
+			remoteAddr: "203.0.113.9:12345",
+			headers: map[string]string{
+				"X-Real-IP":       "198.51.100.7",
+				"X-Forwarded-For": "9.9.9.1",
+			},
+			want: "203.0.113.9",
+		},
+		{
+			name:       "IPv6 loopback peer with X-Real-IP",
+			remoteAddr: "[::1]:54321",
+			headers:    map[string]string{"X-Real-IP": "198.51.100.7"},
+			want:       "198.51.100.7",
+		},
+		{
+			name:       "loopback peer with unparseable X-Real-IP",
+			remoteAddr: "127.0.0.1:54321",
+			headers:    map[string]string{"X-Real-IP": "not-an-ip"},
+			want:       "127.0.0.1",
+		},
+		{
+			name:       "RemoteAddr without a port",
+			remoteAddr: "203.0.113.9",
+			headers:    map[string]string{"X-Forwarded-For": "9.9.9.1"},
+			want:       "203.0.113.9",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, "/stream", nil)
+			req.RemoteAddr = tc.remoteAddr
+			for k, v := range tc.headers {
+				req.Header.Set(k, v)
+			}
+			if got := clientIP(req); got != tc.want {
+				t.Errorf("clientIP = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStreamQuotaSurvivesForgedForwardedFor is the end-to-end form of the
+// bypass: rotating X-Forwarded-For must not hand a visitor a fresh quota.
+func TestStreamQuotaSurvivesForgedForwardedFor(t *testing.T) {
+	h := newTestServer(t, 1, 10)
+	if rec := post(t, h, "https://barrahome.org", `{"session_id":"forger-001","message":"one"}`); rec.Code != http.StatusOK {
+		t.Fatalf("first request status = %d", rec.Code)
+	}
+
+	for i, forged := range []string{"9.9.9.1", "9.9.9.2", "9.9.9.3"} {
+		req := httptest.NewRequest(http.MethodPost, "/stream",
+			strings.NewReader(`{"session_id":"forger-001","message":"again"}`))
+		req.Header.Set("Origin", "https://barrahome.org")
+		req.Header.Set("X-Forwarded-For", forged)
+		req.RemoteAddr = "203.0.113.9:12345"
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != http.StatusTooManyRequests {
+			t.Errorf("request %d with X-Forwarded-For %s: status = %d, want 429", i+1, forged, rec.Code)
+		}
+	}
+}
+
 func TestStreamEnforcesPerIPQuota(t *testing.T) {
 	h := newTestServer(t, 1, 10)
 	if rec := post(t, h, "https://barrahome.org", `{"session_id":"s1","message":"one"}`); rec.Code != http.StatusOK {

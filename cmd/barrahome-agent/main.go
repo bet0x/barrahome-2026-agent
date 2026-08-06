@@ -71,10 +71,12 @@ func supervise() error {
 		return fmt.Errorf("locating own binary: %w", err)
 	}
 
+	// No MaxMemory: sandlock accounts mmap lengths rather than RSS, and Go's
+	// arena reservation exceeds any usable cap at startup, so the worker never
+	// starts. The container's cgroup limit caps memory instead.
 	sb := sandbox.Policy(sandbox.Options{
 		Workspace:    cfg.Workspace,
 		ListenPort:   cfg.ListenPort,
-		MaxMemory:    "192M",
 		MaxProcesses: 16,
 		MaxOpenFiles: 256,
 		MaxCPU:       50,

@@ -354,6 +354,70 @@ func TestRunNoTruncationNoticeOnToolCallPath(t *testing.T) {
 	}
 }
 
+// TestRunReportsUsageSummedAcrossRounds guards the accounting hookup: OnUsage
+// must see the total across every model call the turn made, not just the
+// last one, and it must never be reachable from an Event (it is operational
+// data, not something to send to the browser).
+func TestRunReportsUsageSummedAcrossRounds(t *testing.T) {
+	model := &fakeModel{turns: []*moonshot.Message{
+		{Role: "assistant", ToolCalls: []moonshot.ToolCall{{
+			ID:       "call_1",
+			Type:     "function",
+			Function: moonshot.ToolCallFunc{Name: "read_file", Arguments: `{"path":"cv.md"}`},
+		}}, Usage: &moonshot.Usage{PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110, CachedTokens: 0}},
+		{Role: "assistant", Content: "Tu CV dice que eres SRE.",
+			Usage: &moonshot.Usage{PromptTokens: 150, CompletionTokens: 20, TotalTokens: 170, CachedTokens: 96}},
+	}}
+	var reported *moonshot.Usage
+	var events []Event
+
+	if _, err := Run(context.Background(),
+		Deps{
+			Model: model, Tools: &fakeTools{}, MaxTokens: 512, MaxToolRounds: 4,
+			OnUsage: func(u moonshot.Usage) { reported = &u },
+		},
+		nil, "que dice mi cv?", func(e Event) error {
+			events = append(events, e)
+			return nil
+		}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if reported == nil {
+		t.Fatal("OnUsage was never called")
+	}
+	want := moonshot.Usage{PromptTokens: 250, CompletionTokens: 30, TotalTokens: 280, CachedTokens: 96}
+	if *reported != want {
+		t.Errorf("reported usage = %+v, want %+v (summed across both rounds)", *reported, want)
+	}
+	for _, e := range events {
+		if strings.Contains(e.Text, "100") || strings.Contains(e.Text, "280") {
+			t.Errorf("event %+v looks like it leaked a token count to the visitor", e)
+		}
+	}
+}
+
+// TestRunSkipsUsageReportWhenNoneAvailable guards against recording zeros as
+// if they were real: a model that never reports usage must not trigger OnUsage.
+func TestRunSkipsUsageReportWhenNoneAvailable(t *testing.T) {
+	model := &fakeModel{turns: []*moonshot.Message{
+		{Role: "assistant", Content: "Hola, soy el agente."},
+	}}
+	called := false
+
+	if _, err := Run(context.Background(),
+		Deps{
+			Model: model, Tools: &fakeTools{}, MaxTokens: 512, MaxToolRounds: 4,
+			OnUsage: func(moonshot.Usage) { called = true },
+		},
+		nil, "hola", func(Event) error { return nil }); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if called {
+		t.Error("OnUsage was called even though the model reported no usage")
+	}
+}
+
 func TestToolSchemasCoverAllThreeTools(t *testing.T) {
 	names := map[string]bool{}
 	for _, s := range ToolSchemas() {

@@ -72,6 +72,10 @@ type Deps struct {
 	Tools         ToolRunner
 	MaxTokens     int
 	MaxToolRounds int
+	// OnUsage, if set, is called once per Run with the token cost summed
+	// across every model call the turn made (including tool rounds). It is
+	// operational data — never sent to the visitor.
+	OnUsage func(moonshot.Usage)
 }
 
 // ToolSchemas declares the three read-only tools to the model.
@@ -129,6 +133,15 @@ func Run(
 		deps.MaxToolRounds = 4
 	}
 
+	// total is reported however the turn ends, including on error: tokens
+	// already spent are a real cost regardless of whether the turn succeeded.
+	var total moonshot.Usage
+	defer func() {
+		if deps.OnUsage != nil && total.TotalTokens > 0 {
+			deps.OnUsage(total)
+		}
+	}()
+
 	convo := append([]moonshot.Message(nil), history...)
 	convo = append(convo, moonshot.Message{Role: "user", Content: userMessage})
 
@@ -137,6 +150,7 @@ func Run(
 		if err != nil {
 			return nil, err
 		}
+		addUsage(&total, assistant.Usage)
 		convo = append(convo, *assistant)
 
 		if len(assistant.ToolCalls) == 0 {
@@ -171,10 +185,23 @@ func Run(
 	if err != nil {
 		return nil, err
 	}
+	addUsage(&total, assistant.Usage)
 	if err := emitTruncationNotice(assistant, emit); err != nil {
 		return nil, err
 	}
 	return append(convo, *assistant), nil
+}
+
+// addUsage folds u into total; u is nil when the upstream reported no usage
+// for that call, which must not be counted as zero tokens spent.
+func addUsage(total *moonshot.Usage, u *moonshot.Usage) {
+	if u == nil {
+		return
+	}
+	total.PromptTokens += u.PromptTokens
+	total.CompletionTokens += u.CompletionTokens
+	total.TotalTokens += u.TotalTokens
+	total.CachedTokens += u.CachedTokens
 }
 
 // emitTruncationNotice tells the visitor when a turn ended because max_tokens
@@ -197,7 +224,14 @@ func streamTurn(
 	tools []moonshot.ToolDef,
 	emit Emit,
 ) (*moonshot.Message, error) {
-	upstream := append([]moonshot.Message{{Role: "system", Content: SystemPrompt}}, convo...)
+	system := SystemPrompt
+	if deps.MaxTokens > 0 {
+		// The truncation notice is a fallback for when this doesn't work, not
+		// a substitute for it: telling the model its ceiling lets it wrap up
+		// on its own instead of being cut off mid-sentence.
+		system += fmt.Sprintf("\nYour reply is capped at %d tokens; finish within that budget.", deps.MaxTokens)
+	}
+	upstream := append([]moonshot.Message{{Role: "system", Content: system}}, convo...)
 	return deps.Model.Stream(ctx, upstream, tools, deps.MaxTokens,
 		func(chunk string) error {
 			return emit(Event{Kind: EventText, Text: chunk})

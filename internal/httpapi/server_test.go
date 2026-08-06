@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -152,6 +153,14 @@ func TestStreamRejectsMalformedSessionID(t *testing.T) {
 	}
 }
 
+func TestStreamRejectsMissingOrigin(t *testing.T) {
+	h := newTestServer(t, 20, 10)
+	rec := post(t, h, "", `{"session_id":"session-0001","message":"hola"}`)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", rec.Code)
+	}
+}
+
 // TestStreamCountsMessageInRunes keeps the advertised 4000-character limit
 // honest for multi-byte text: 4000 CJK characters are ~12KB and must pass,
 // while 4001 must not.
@@ -166,6 +175,109 @@ func TestStreamCountsMessageInRunes(t *testing.T) {
 	body = `{"session_id":"runes-0002","message":"` + strings.Repeat("字", maxMessageRunes+1) + `"}`
 	if rec := post(t, h, "https://barrahome.org", body); rec.Code != http.StatusBadRequest {
 		t.Errorf("4001 runes status = %d, want 400", rec.Code)
+	}
+}
+
+// TestStreamDistinguishesQuotaFromBusy separates the two rejections that the
+// limiter can produce: the hourly quota is 429 (retry later), a saturated
+// concurrency cap is 503 (retry now-ish).
+func TestStreamDistinguishesQuotaFromBusy(t *testing.T) {
+	d := newTestDeps(t, 20, 1)
+	model := &blockingModel{started: make(chan struct{}), proceed: make(chan struct{})}
+	d.Model = model
+	h := NewServer(d)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		post(t, h, "https://barrahome.org", `{"session_id":"holder-0001","message":"one"}`)
+	}()
+
+	select {
+	case <-model.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request never reached the model")
+	}
+
+	// A different session, so it is the concurrency cap that trips and not the
+	// per-session checkout.
+	rec := post(t, h, "https://barrahome.org", `{"session_id":"second-0002","message":"two"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("concurrency-capped status = %d, want 503", rec.Code)
+	}
+
+	close(model.proceed)
+	wg.Wait()
+}
+
+// TestStreamReturns409OnTurnLimit checks a spent session is refused, and that
+// the message distinguishes it from the busy-session 409.
+func TestStreamReturns409OnTurnLimit(t *testing.T) {
+	d := newTestDeps(t, 20, 10)
+	d.Sessions = session.NewStore(session.Config{MaxTurns: 1})
+	h := NewServer(d)
+
+	if rec := post(t, h, "https://barrahome.org", `{"session_id":"spender-01","message":"one"}`); rec.Code != http.StatusOK {
+		t.Fatalf("first request status = %d", rec.Code)
+	}
+	rec := post(t, h, "https://barrahome.org", `{"session_id":"spender-01","message":"two"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("second request status = %d, want 409", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "turn limit") {
+		t.Errorf("body = %q, want the turn-limit message", rec.Body.String())
+	}
+}
+
+// TestStreamReturns503WhenStoreFull covers ErrStoreFull: the store is at its
+// cap and the only session in it is checked out, so a new id has nothing to
+// evict.
+func TestStreamReturns503WhenStoreFull(t *testing.T) {
+	d := newTestDeps(t, 20, 10)
+	d.Sessions = session.NewStore(session.Config{MaxSessions: 1})
+	model := &blockingModel{started: make(chan struct{}), proceed: make(chan struct{})}
+	d.Model = model
+	h := NewServer(d)
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		post(t, h, "https://barrahome.org", `{"session_id":"occupant-1","message":"one"}`)
+	}()
+
+	select {
+	case <-model.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first request never reached the model")
+	}
+
+	rec := post(t, h, "https://barrahome.org", `{"session_id":"newcomer-1","message":"two"}`)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("store-full status = %d, want 503", rec.Code)
+	}
+
+	close(model.proceed)
+	wg.Wait()
+}
+
+// TestStreamReportsTurnsLeftFromStore pins the minor fix: with Cfg.MaxTurns
+// unset the store's own default is the allowance, so turns_left has to come
+// from the session rather than a subtraction against the config.
+func TestStreamReportsTurnsLeftFromStore(t *testing.T) {
+	d := newTestDeps(t, 20, 10)
+	d.Cfg.MaxTurns = 0
+	d.Sessions = session.NewStore(session.Config{})
+	h := NewServer(d)
+
+	rec := post(t, h, "https://barrahome.org", `{"session_id":"counter-01","message":"hola"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	want := fmt.Sprintf(`{"turns_left":%d}`, session.DefaultMaxTurns-1)
+	if !strings.Contains(rec.Body.String(), want) {
+		t.Errorf("body = %q, want it to contain %s", rec.Body.String(), want)
 	}
 }
 

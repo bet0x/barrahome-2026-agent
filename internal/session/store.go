@@ -12,6 +12,12 @@ import (
 // ErrTurnLimit is returned once a session has used its allowance of turns.
 var ErrTurnLimit = errors.New("session turn limit reached")
 
+// ErrSessionBusy is returned when a session already has an outstanding
+// checkout. A session models one browser tab talking to the agent, so a
+// second concurrent request for the same id is refused rather than left to
+// race the first over the same Messages slice and Turns counter.
+var ErrSessionBusy = errors.New("session already in use")
+
 // Session is one visitor's conversation. Nothing is persisted to disk.
 type Session struct {
 	ID       string
@@ -20,58 +26,86 @@ type Session struct {
 	LastSeen time.Time
 }
 
+// entry is the store's bookkeeping around a Session: whether it currently
+// has an outstanding checkout, which both excludes concurrent callers and
+// protects it from Sweep.
+type entry struct {
+	sess       *Session
+	checkedOut bool
+}
+
 // Store holds live sessions with a TTL and a per-session turn cap.
 type Store struct {
 	mu       sync.Mutex
-	sessions map[string]*Session
+	sessions map[string]*entry
 	ttl      time.Duration
 	maxTurns int
 }
 
-// NewStore returns a store evicting sessions idle longer than ttl.
+// NewStore returns a store evicting idle sessions after ttl and capping each
+// session at maxTurns checkouts.
 func NewStore(ttl time.Duration, maxTurns int) *Store {
 	return &Store{
-		sessions: make(map[string]*Session),
+		sessions: make(map[string]*entry),
 		ttl:      ttl,
 		maxTurns: maxTurns,
 	}
 }
 
-// GetOrCreate returns the session for id, creating it if absent. It returns
-// ErrTurnLimit once the session has spent its turns.
-func (s *Store) GetOrCreate(id string, now time.Time) (*Session, error) {
+// Checkout reserves the session for id — creating it on first use — for
+// exclusive use by the caller and returns a release func to call when done.
+// The turn is spent atomically with the reservation, so callers must not
+// touch Session.Turns themselves.
+//
+// It returns ErrSessionBusy if the session already has an outstanding
+// checkout, and ErrTurnLimit once the session has spent its turns. The lock
+// is not held past this call: callers are expected to do their (possibly
+// slow) work between Checkout and release.
+func (s *Store) Checkout(id string, now time.Time) (*Session, func(), error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	sess, ok := s.sessions[id]
+	e, ok := s.sessions[id]
 	if !ok {
-		sess = &Session{ID: id, LastSeen: now}
-		s.sessions[id] = sess
-		return sess, nil
+		e = &entry{sess: &Session{ID: id, LastSeen: now}}
+		s.sessions[id] = e
 	}
-	if sess.Turns >= s.maxTurns {
-		return nil, ErrTurnLimit
+	if e.checkedOut {
+		return nil, nil, ErrSessionBusy
 	}
-	sess.LastSeen = now
-	return sess, nil
+	if e.sess.Turns >= s.maxTurns {
+		return nil, nil, ErrTurnLimit
+	}
+
+	e.checkedOut = true
+	e.sess.Turns++
+	e.sess.LastSeen = now
+	return e.sess, s.releaseFunc(e), nil
 }
 
-// Save records the session's updated state.
-func (s *Store) Save(sess *Session, now time.Time) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	sess.LastSeen = now
-	s.sessions[sess.ID] = sess
+// releaseFunc closes over e directly rather than re-reading s.sessions[id],
+// so a stale release can never touch whatever session has since taken the
+// same id — there is nothing here that could resurrect an evicted session.
+func (s *Store) releaseFunc(e *entry) func() {
+	return func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		e.checkedOut = false
+	}
 }
 
-// Sweep drops sessions idle for longer than the TTL and returns how many went.
+// Sweep drops idle sessions that are not currently checked out and returns
+// how many went.
 func (s *Store) Sweep(now time.Time) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	removed := 0
-	for id, sess := range s.sessions {
-		if now.Sub(sess.LastSeen) > s.ttl {
+	for id, e := range s.sessions {
+		if e.checkedOut {
+			continue
+		}
+		if now.Sub(e.sess.LastSeen) > s.ttl {
 			delete(s.sessions, id)
 			removed++
 		}

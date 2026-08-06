@@ -110,6 +110,11 @@ func (t *Tools) ReadFile(rel string) (string, error) {
 	if len(buf) > MaxFileBytes {
 		return string(buf[:MaxFileBytes]) + fmt.Sprintf("\n\n[truncated: showing the first %d bytes]", MaxFileBytes), nil
 	}
+	if len(buf) == 0 {
+		// A bare "" is indistinguishable from a call error once this crosses
+		// into a moonshot.Message: say so explicitly.
+		return fmt.Sprintf("%s is empty", displayPath(rel)), nil
+	}
 	return string(buf), nil
 }
 

@@ -73,6 +73,24 @@ func TestReadFile(t *testing.T) {
 	}
 }
 
+func TestReadFileEmptyFile(t *testing.T) {
+	tools, root := newTestTools(t)
+	if err := os.WriteFile(filepath.Join(root, "empty.md"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := tools.ReadFile("empty.md")
+	if err != nil {
+		t.Fatalf("ReadFile(empty.md): %v", err)
+	}
+	if out == "" {
+		t.Error("ReadFile on an empty file returned \"\", want an explicit note")
+	}
+	if !strings.Contains(strings.ToLower(out), "empty") {
+		t.Errorf("ReadFile(empty.md) = %q, want it to say the file is empty", out)
+	}
+}
+
 func TestReadFileTruncatesLargeFiles(t *testing.T) {
 	tools, root := newTestTools(t)
 	big := strings.Repeat("x", MaxFileBytes+5000)

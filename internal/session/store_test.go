@@ -2,27 +2,30 @@ package session
 
 import (
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bet0x/barrahome-2026-agent/internal/moonshot"
 )
 
-func TestGetOrCreateReturnsSameSession(t *testing.T) {
+func TestCheckoutPreservesHistory(t *testing.T) {
 	st := NewStore(30*time.Minute, 20)
 	now := time.Now()
 
-	s1, err := st.GetOrCreate("abc", now)
+	s1, release1, err := st.Checkout("abc", now)
 	if err != nil {
 		t.Fatal(err)
 	}
 	s1.Messages = append(s1.Messages, moonshot.Message{Role: "user", Content: "hola"})
-	st.Save(s1, now)
+	release1()
 
-	s2, err := st.GetOrCreate("abc", now.Add(time.Minute))
+	s2, release2, err := st.Checkout("abc", now.Add(time.Minute))
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer release2()
 	if len(s2.Messages) != 1 || s2.Messages[0].Content != "hola" {
 		t.Errorf("history not preserved: %+v", s2.Messages)
 	}
@@ -31,20 +34,112 @@ func TestGetOrCreateReturnsSameSession(t *testing.T) {
 	}
 }
 
-func TestTurnLimit(t *testing.T) {
+func TestCheckoutTurnLimit(t *testing.T) {
 	st := NewStore(30*time.Minute, 2)
 	now := time.Now()
 
 	for i := 0; i < 2; i++ {
-		s, err := st.GetOrCreate("abc", now)
+		_, release, err := st.Checkout("abc", now)
 		if err != nil {
 			t.Fatalf("turn %d: %v", i, err)
 		}
-		s.Turns++
-		st.Save(s, now)
+		release()
 	}
-	if _, err := st.GetOrCreate("abc", now); !errors.Is(err, ErrTurnLimit) {
+	if _, _, err := st.Checkout("abc", now); !errors.Is(err, ErrTurnLimit) {
 		t.Errorf("third turn error = %v, want ErrTurnLimit", err)
+	}
+}
+
+func TestCheckoutRefusesConcurrentSameSession(t *testing.T) {
+	st := NewStore(30*time.Minute, 20)
+	now := time.Now()
+
+	_, release, err := st.Checkout("abc", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := st.Checkout("abc", now); !errors.Is(err, ErrSessionBusy) {
+		t.Errorf("second concurrent checkout error = %v, want ErrSessionBusy", err)
+	}
+
+	release()
+
+	// Once released, the id is free again.
+	_, release2, err := st.Checkout("abc", now)
+	if err != nil {
+		t.Fatalf("checkout after release: %v", err)
+	}
+	release2()
+}
+
+// TestConcurrentCheckoutRespectsTurnCap reproduces the reviewer's race
+// (many goroutines hammering one session id under a low turn cap) against
+// the new API: each goroutine retries on ErrSessionBusy and stops on
+// ErrTurnLimit, and the number that ever complete a checkout must equal
+// maxTurns exactly, not more.
+func TestConcurrentCheckoutRespectsTurnCap(t *testing.T) {
+	const maxTurns = 3
+	const workers = 20
+
+	st := NewStore(30*time.Minute, maxTurns)
+	now := time.Now()
+
+	var successes atomic.Int64
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				sess, release, err := st.Checkout("shared", now)
+				switch {
+				case errors.Is(err, ErrSessionBusy):
+					continue // another worker holds it right now; retry
+				case errors.Is(err, ErrTurnLimit):
+					return // cap spent; give up
+				case err != nil:
+					t.Errorf("unexpected error: %v", err)
+					return
+				}
+				sess.Messages = append(sess.Messages, moonshot.Message{Role: "user", Content: "hi"})
+				release()
+				successes.Add(1)
+				return
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := successes.Load(); got != maxTurns {
+		t.Errorf("successful checkouts = %d, want exactly %d", got, maxTurns)
+	}
+}
+
+func TestSweepSkipsCheckedOutSession(t *testing.T) {
+	st := NewStore(30*time.Minute, 20)
+	now := time.Now()
+	stale := now.Add(-31 * time.Minute)
+
+	_, release, err := st.Checkout("stale", stale)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if removed := st.Sweep(now); removed != 0 {
+		t.Errorf("Sweep removed %d checked-out sessions, want 0", removed)
+	}
+	if st.Len() != 1 {
+		t.Errorf("Len() = %d, want 1 while checked out", st.Len())
+	}
+
+	release()
+
+	if removed := st.Sweep(now); removed != 1 {
+		t.Errorf("Sweep removed %d after release, want 1", removed)
+	}
+	if st.Len() != 0 {
+		t.Errorf("Len() = %d after sweep, want 0", st.Len())
 	}
 }
 
@@ -52,18 +147,63 @@ func TestSweepEvictsIdleSessions(t *testing.T) {
 	st := NewStore(30*time.Minute, 20)
 	now := time.Now()
 
-	if _, err := st.GetOrCreate("fresh", now); err != nil {
+	_, releaseFresh, err := st.Checkout("fresh", now)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.GetOrCreate("stale", now.Add(-31*time.Minute)); err != nil {
+	releaseFresh()
+	_, releaseStale, err := st.Checkout("stale", now.Add(-31*time.Minute))
+	if err != nil {
 		t.Fatal(err)
 	}
+	releaseStale()
 
 	if removed := st.Sweep(now); removed != 1 {
 		t.Errorf("Sweep removed %d, want 1", removed)
 	}
 	if st.Len() != 1 {
 		t.Errorf("Len() = %d after sweep, want 1", st.Len())
+	}
+}
+
+// TestReleaseCannotResurrectEvictedSession reproduces the reviewer's
+// deterministic (no goroutines needed) bug: a handler's stale release,
+// called after its session was evicted and a fresh one took the same id,
+// must not clobber the fresh session's history.
+func TestReleaseCannotResurrectEvictedSession(t *testing.T) {
+	st := NewStore(30*time.Minute, 20)
+	t0 := time.Now()
+
+	sess1, release1, err := st.Checkout("abc", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess1.Messages = append(sess1.Messages, moonshot.Message{Role: "user", Content: "old"})
+	release1()
+
+	later := t0.Add(31 * time.Minute)
+	if removed := st.Sweep(later); removed != 1 {
+		t.Fatalf("Sweep removed %d, want 1", removed)
+	}
+
+	sess2, release2, err := st.Checkout("abc", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess2.Messages = append(sess2.Messages, moonshot.Message{Role: "user", Content: "new"})
+	release2()
+
+	// The stale release for the evicted session must be a no-op against
+	// the fresh session that has since taken its place under the same id.
+	release1()
+
+	sess3, release3, err := st.Checkout("abc", later)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release3()
+	if len(sess3.Messages) != 1 || sess3.Messages[0].Content != "new" {
+		t.Errorf("resurrected stale session: %+v", sess3.Messages)
 	}
 }
 
@@ -75,9 +215,11 @@ func TestSweeperRunsOnTick(t *testing.T) {
 	st := NewStore(30*time.Minute, 20)
 	base := time.Now()
 
-	if _, err := st.GetOrCreate("stale", base.Add(-31*time.Minute)); err != nil {
+	_, release, err := st.Checkout("stale", base.Add(-31*time.Minute))
+	if err != nil {
 		t.Fatal(err)
 	}
+	release()
 
 	ticks := make(chan time.Time)
 	stop := make(chan struct{})

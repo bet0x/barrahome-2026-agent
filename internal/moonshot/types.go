@@ -3,9 +3,12 @@
 package moonshot
 
 // Message is one entry of the conversation sent upstream.
+//
+// Content has no omitempty: tool-role messages require the key even when
+// empty, and the struct tag can't vary that by role.
 type Message struct {
 	Role       string     `json:"role"`
-	Content    string     `json:"content,omitempty"`
+	Content    string     `json:"content"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
 }

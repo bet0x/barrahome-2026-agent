@@ -157,10 +157,13 @@ func serve() error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
+	drained := make(chan struct{})
 	go func() {
+		defer close(drained)
 		<-ctx.Done()
 		shutdownCtx, done := context.WithTimeout(context.Background(), 10*time.Second)
 		defer done()
+		log.Printf("shutting down, draining in-flight requests")
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
@@ -168,5 +171,10 @@ func serve() error {
 	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
+	// ListenAndServe returns as soon as Shutdown is called, so wait for the
+	// drain to finish. Otherwise the deferred close(stop) and the process exit
+	// race the streams still being written.
+	<-drained
+	log.Printf("drained, exiting")
 	return nil
 }

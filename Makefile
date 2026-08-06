@@ -19,3 +19,17 @@ run: build
 
 clean:
 	rm -f barrahome-agent
+
+.PHONY: image up down logs
+
+image:
+	docker build -f Dockerfile -t barrahome-agent:dev .
+
+up:
+	docker compose up -d --build
+
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f

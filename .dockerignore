@@ -1,0 +1,4 @@
+.git
+.env
+tmp/
+third_party/sandlock/target/

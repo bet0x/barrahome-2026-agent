@@ -1,0 +1,39 @@
+# Local development stack. seccomp=unconfined is mandatory: with Docker's
+# default profile sandlock cannot create a sandbox at all (verified on both the
+# dev machine and the VPS). Namespaces, dropped capabilities, the read-only
+# rootfs and cgroup limits all remain in force, and sandlock applies its own
+# syscall filter to the worker.
+services:
+  agent:
+    image: barrahome-agent:dev
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: barrahome-agent
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # .env's BARRAHOME_WORKSPACE is the host path used for native runs; the
+      # volume below mounts it at /workspace, so the value inside the
+      # container must be /workspace, not the host path.
+      BARRAHOME_WORKSPACE: /workspace
+      BARRAHOME_PORT: "9000"
+    ports:
+      - "127.0.0.1:9000:9000"
+    volumes:
+      - ${BARRAHOME_WORKSPACE:-../barrahome-2026}:/workspace:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=unconfined
+    mem_limit: 512m
+    pids_limit: 128
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

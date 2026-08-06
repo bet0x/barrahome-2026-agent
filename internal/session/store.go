@@ -48,7 +48,12 @@ type Session struct {
 	ID       string
 	Messages []moonshot.Message
 	Turns    int
-	LastSeen time.Time
+	// TurnsLeft is the allowance still unspent after the turn the current
+	// checkout reserved. The store owns the cap — including the default it
+	// applies when Config.MaxTurns is zero — so callers read it here instead
+	// of subtracting against a cap they only think they know.
+	TurnsLeft int
+	LastSeen  time.Time
 }
 
 // entry is the store's bookkeeping around a Session: whether it currently
@@ -142,6 +147,7 @@ func (s *Store) Checkout(id string, now time.Time) (*Session, func(), error) {
 	e.checkedOut = true
 	e.checkedOutAt = now
 	e.sess.Turns++
+	e.sess.TurnsLeft = s.maxTurns - e.sess.Turns
 	e.sess.LastSeen = now
 	return e.sess, s.releaseFunc(e), nil
 }

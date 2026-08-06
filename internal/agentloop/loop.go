@@ -43,12 +43,18 @@ type ToolRunner interface {
 // EventKind identifies what happened during a run.
 type EventKind string
 
-// Event kinds streamed to the browser.
+// Event kinds streamed to the browser. Unknown kinds are meant to be ignored
+// by older frontends, so adding one is backward compatible.
 const (
 	EventText       EventKind = "text"
 	EventToolStart  EventKind = "tool_start"
 	EventToolResult EventKind = "tool_result"
+	EventTruncated  EventKind = "truncated"
 )
+
+// truncationNotice tells the visitor an answer was cut off by max_tokens,
+// rather than leaving a mid-word stop looking like a broken agent.
+const truncationNotice = "[response was cut short at the length limit]"
 
 // Event is one thing worth telling the frontend about.
 type Event struct {
@@ -134,6 +140,9 @@ func Run(
 		convo = append(convo, *assistant)
 
 		if len(assistant.ToolCalls) == 0 {
+			if err := emitTruncationNotice(assistant, emit); err != nil {
+				return nil, err
+			}
 			return convo, nil
 		}
 
@@ -162,7 +171,21 @@ func Run(
 	if err != nil {
 		return nil, err
 	}
+	if err := emitTruncationNotice(assistant, emit); err != nil {
+		return nil, err
+	}
 	return append(convo, *assistant), nil
+}
+
+// emitTruncationNotice tells the visitor when a turn ended because max_tokens
+// was reached, rather than letting a mid-word cutoff read as a broken agent.
+// It does not retry or continue the generation: that would multiply cost on
+// exactly the responses that are already the most expensive.
+func emitTruncationNotice(assistant *moonshot.Message, emit Emit) error {
+	if assistant.FinishReason != "length" {
+		return nil
+	}
+	return emit(Event{Kind: EventTruncated, Text: truncationNotice})
 }
 
 // streamTurn sends convo upstream with a fresh system prompt and the given

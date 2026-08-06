@@ -11,6 +11,11 @@ type Message struct {
 	Content    string     `json:"content"`
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
+
+	// FinishReason records why the API ended this turn (e.g. "stop",
+	// "length", "tool_calls"). Stream sets it on the message it returns;
+	// it is never sent upstream, so it stays out of the wire format.
+	FinishReason string `json:"-"`
 }
 
 // ToolCall is a function call the model asked for.

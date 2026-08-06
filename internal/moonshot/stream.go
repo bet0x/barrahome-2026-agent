@@ -127,6 +127,7 @@ func (c *Client) Stream(
 	}
 	partials := map[int]*partialCall{}
 	sawDone := false
+	finishReason := ""
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -153,6 +154,9 @@ func (c *Client) Stream(
 		// We never request n>1, so only the first choice is ours; a stray
 		// second choice must not be merged into the same text/tool-call state.
 		choice := chunk.Choices[0]
+		if choice.FinishReason != "" {
+			finishReason = choice.FinishReason
+		}
 		if choice.Delta.Content != "" {
 			text.WriteString(choice.Delta.Content)
 			if onText != nil {
@@ -187,6 +191,7 @@ func (c *Client) Stream(
 	}
 
 	out.Content = text.String()
+	out.FinishReason = finishReason
 
 	indexes := make([]int, 0, len(partials))
 	for i := range partials {

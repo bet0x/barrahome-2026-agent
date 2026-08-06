@@ -259,6 +259,101 @@ func TestRunAbortsPromptlyWhenEmitErrors(t *testing.T) {
 	}
 }
 
+// TestRunEmitsTruncationNoticeOnLengthFinish guards against silent
+// truncation: a turn that hit max_tokens must tell the visitor, not just
+// stop mid-word as if the agent had broken.
+func TestRunEmitsTruncationNoticeOnLengthFinish(t *testing.T) {
+	model := &fakeModel{turns: []*moonshot.Message{
+		{Role: "assistant", Content: "Si necesitas escalar en complejidad (múltiples autores, tax", FinishReason: "length"},
+	}}
+	var kinds []EventKind
+	var noticeText string
+
+	if _, err := Run(context.Background(),
+		Deps{Model: model, Tools: &fakeTools{}, MaxTokens: 512, MaxToolRounds: 4},
+		nil, "hola", func(e Event) error {
+			kinds = append(kinds, e.Kind)
+			if e.Kind == EventTruncated {
+				noticeText = e.Text
+			}
+			return nil
+		}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var count int
+	for _, k := range kinds {
+		if k == EventTruncated {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("EventTruncated emitted %d times, want 1: %v", count, kinds)
+	}
+	if noticeText == "" {
+		t.Error("truncation notice text is empty")
+	}
+}
+
+// TestRunNoTruncationNoticeOnNormalFinish guards against false positives: an
+// answer that simply finished must not carry the truncation notice.
+func TestRunNoTruncationNoticeOnNormalFinish(t *testing.T) {
+	model := &fakeModel{turns: []*moonshot.Message{
+		{Role: "assistant", Content: "Hola, soy el agente.", FinishReason: "stop"},
+	}}
+	var kinds []EventKind
+
+	if _, err := Run(context.Background(),
+		Deps{Model: model, Tools: &fakeTools{}, MaxTokens: 512, MaxToolRounds: 4},
+		nil, "hola", func(e Event) error {
+			kinds = append(kinds, e.Kind)
+			return nil
+		}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	for _, k := range kinds {
+		if k == EventTruncated {
+			t.Errorf("EventTruncated emitted for a normal stop: %v", kinds)
+		}
+	}
+}
+
+// TestRunNoTruncationNoticeOnToolCallPath guards against a false positive on
+// the tool-call path: a turn that ends because the model requested a tool
+// legitimately ends without being truncated, even if (adversarially, to
+// exercise the branch) its finish_reason were "length".
+func TestRunNoTruncationNoticeOnToolCallPath(t *testing.T) {
+	model := &fakeModel{turns: []*moonshot.Message{
+		{
+			Role:         "assistant",
+			FinishReason: "length",
+			ToolCalls: []moonshot.ToolCall{{
+				ID:       "call_1",
+				Type:     "function",
+				Function: moonshot.ToolCallFunc{Name: "read_file", Arguments: `{"path":"cv.md"}`},
+			}},
+		},
+		{Role: "assistant", Content: "Tu CV dice que eres SRE.", FinishReason: "stop"},
+	}}
+	var kinds []EventKind
+
+	if _, err := Run(context.Background(),
+		Deps{Model: model, Tools: &fakeTools{}, MaxTokens: 512, MaxToolRounds: 4},
+		nil, "que dice mi cv?", func(e Event) error {
+			kinds = append(kinds, e.Kind)
+			return nil
+		}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	for _, k := range kinds {
+		if k == EventTruncated {
+			t.Errorf("EventTruncated emitted on the tool-call path: %v", kinds)
+		}
+	}
+}
+
 func TestToolSchemasCoverAllThreeTools(t *testing.T) {
 	names := map[string]bool{}
 	for _, s := range ToolSchemas() {

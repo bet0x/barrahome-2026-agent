@@ -84,6 +84,39 @@ func TestStreamAssemblesToolCalls(t *testing.T) {
 	}
 }
 
+// TestStreamCapturesFinishReason guards the root cause of a silent-truncation
+// bug: finish_reason was parsed off the wire but never surfaced, so callers
+// couldn't tell a length cutoff from a normal stop.
+func TestStreamCapturesFinishReason(t *testing.T) {
+	tests := []struct {
+		name   string
+		reason string
+	}{
+		{"stop", "stop"},
+		{"length", "length"},
+		{"tool_calls", "tool_calls"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := sseServer(t, []string{
+				`{"choices":[{"delta":{"role":"assistant","content":"partial"}}]}`,
+				fmt.Sprintf(`{"choices":[{"delta":{},"finish_reason":%q}]}`, tt.reason),
+			})
+			defer srv.Close()
+
+			c := NewClient(srv.URL, "test-key", DefaultModel, srv.Client())
+			msg, err := c.Stream(context.Background(),
+				[]Message{{Role: "user", Content: "hola"}}, nil, 512, nil)
+			if err != nil {
+				t.Fatalf("Stream: %v", err)
+			}
+			if msg.FinishReason != tt.reason {
+				t.Errorf("FinishReason = %q, want %q", msg.FinishReason, tt.reason)
+			}
+		})
+	}
+}
+
 // TestStreamHandlesLineSplitAcrossReads guards against a data: line arriving
 // in more than one TCP read: the handler flushes mid-line, forcing the
 // client's scanner to buffer a partial line before it sees the newline.

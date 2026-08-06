@@ -1,0 +1,112 @@
+package sandbox
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+func testOptions(t *testing.T, workspace string) Options {
+	t.Helper()
+	return Options{
+		Workspace:    workspace,
+		ListenPort:   9000,
+		MaxMemory:    "192M",
+		MaxProcesses: 16,
+		MaxOpenFiles: 256,
+		MaxCPU:       50,
+	}
+}
+
+// TestPolicyConfinesFilesystem is the core guarantee: the worker can read the
+// workspace and nothing else on the host.
+func TestPolicyConfinesFilesystem(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "post.md"), []byte("hello workspace"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "secret.txt")
+	if err := os.WriteFile(outside, []byte("TOPSECRET"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	sb := Policy(testOptions(t, ws))
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	res, err := sb.Run(ctx, "cat", filepath.Join(ws, "post.md"))
+	if err != nil {
+		t.Fatalf("running allowed read: %v", err)
+	}
+	if got := string(res.Stdout); !strings.Contains(got, "hello workspace") {
+		t.Errorf("workspace file should be readable, got exit=%d stdout=%q stderr=%q",
+			res.ExitCode, got, res.Stderr)
+	}
+
+	res, err = sb.Run(ctx, "cat", outside)
+	if err != nil {
+		t.Fatalf("running denied read: %v", err)
+	}
+	if res.ExitCode == 0 {
+		t.Errorf("file outside workspace must not be readable, but cat succeeded: %q", res.Stdout)
+	}
+
+	res, err = sb.Run(ctx, "cat", "/etc/shadow")
+	if err != nil {
+		t.Fatalf("running /etc/shadow read: %v", err)
+	}
+	if res.ExitCode == 0 {
+		t.Errorf("/etc/shadow must not be readable; policy is granting /etc too broadly")
+	}
+}
+
+// TestPolicyRestrictsEgress asserts the only reachable destination is Moonshot.
+func TestPolicyRestrictsEgress(t *testing.T) {
+	sb := Policy(testOptions(t, t.TempDir()))
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	// Allowed: reaching Moonshot without a key yields HTTP 401, which proves
+	// the connection and TLS handshake completed.
+	res, err := sb.Run(ctx, "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+		"--max-time", "25", "https://api.moonshot.ai/v1/models")
+	if err != nil {
+		t.Fatalf("running allowed egress: %v", err)
+	}
+	if got := strings.TrimSpace(string(res.Stdout)); got != "401" {
+		t.Errorf("api.moonshot.ai should be reachable (expect HTTP 401), got %q stderr=%q", got, res.Stderr)
+	}
+
+	for _, target := range []string{"https://example.com", "https://1.1.1.1"} {
+		res, err := sb.Run(ctx, "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+			"--max-time", "10", target)
+		if err != nil {
+			t.Fatalf("running denied egress %s: %v", target, err)
+		}
+		if got := strings.TrimSpace(string(res.Stdout)); got != "000" {
+			t.Errorf("%s must be unreachable (expect http_code 000), got %q", target, got)
+		}
+	}
+}
+
+// TestPolicyEnforcesMemoryLimit guards the resource cap that protects the
+// shared VPS from a runaway worker.
+func TestPolicyEnforcesMemoryLimit(t *testing.T) {
+	opts := testOptions(t, t.TempDir())
+	opts.MaxMemory = "64M"
+	sb := Policy(opts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	res, err := sb.Run(ctx, "python3", "-c", "b=bytearray(256*1024*1024);print('allocated')")
+	if err != nil {
+		t.Fatalf("running allocation: %v", err)
+	}
+	if res.ExitCode == 0 {
+		t.Errorf("256MB allocation should fail under MaxMemory=64M, got exit=0 stdout=%q", res.Stdout)
+	}
+}

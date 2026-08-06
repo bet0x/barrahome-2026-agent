@@ -11,7 +11,7 @@ import (
 )
 
 func TestCheckoutPreservesHistory(t *testing.T) {
-	st := NewStore(30*time.Minute, 20)
+	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
 	now := time.Now()
 
 	s1, release1, err := st.Checkout("abc", now)
@@ -35,7 +35,7 @@ func TestCheckoutPreservesHistory(t *testing.T) {
 }
 
 func TestCheckoutTurnLimit(t *testing.T) {
-	st := NewStore(30*time.Minute, 2)
+	st := NewStore(30*time.Minute, 2, DefaultCheckoutDeadline, 20)
 	now := time.Now()
 
 	for i := 0; i < 2; i++ {
@@ -51,7 +51,7 @@ func TestCheckoutTurnLimit(t *testing.T) {
 }
 
 func TestCheckoutRefusesConcurrentSameSession(t *testing.T) {
-	st := NewStore(30*time.Minute, 20)
+	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
 	now := time.Now()
 
 	_, release, err := st.Checkout("abc", now)
@@ -77,7 +77,7 @@ func TestCheckoutRefusesConcurrentSameSession(t *testing.T) {
 // caller that writes it immediately after Checkout, before checking err,
 // must not panic on the ErrSessionBusy or ErrTurnLimit paths.
 func TestErrorPathsReturnUsableRelease(t *testing.T) {
-	st := NewStore(30*time.Minute, 1)
+	st := NewStore(30*time.Minute, 1, DefaultCheckoutDeadline, 20)
 	now := time.Now()
 
 	_, release, err := st.Checkout("abc", now)
@@ -111,7 +111,7 @@ func TestErrorPathsReturnUsableRelease(t *testing.T) {
 // out from under it. Without idempotency, the second call here would free
 // "abc" for a third party while B still believes it holds it exclusively.
 func TestReleaseIsIdempotent(t *testing.T) {
-	st := NewStore(30*time.Minute, 20)
+	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
 	now := time.Now()
 
 	_, releaseA, err := st.Checkout("abc", now)
@@ -142,7 +142,7 @@ func TestConcurrentCheckoutRespectsTurnCap(t *testing.T) {
 	const maxTurns = 3
 	const workers = 20
 
-	st := NewStore(30*time.Minute, maxTurns)
+	st := NewStore(30*time.Minute, maxTurns, DefaultCheckoutDeadline, 20)
 	now := time.Now()
 
 	// Bounded, not "for {}": if a regression ever makes release stop
@@ -182,13 +182,13 @@ func TestConcurrentCheckoutRespectsTurnCap(t *testing.T) {
 	}
 }
 
-// TestSweepSkipsRecentCheckedOutSession uses a ttl shorter than
-// CheckoutDeadline so the two exemptions don't overlap: LastSeen alone
+// TestSweepSkipsRecentCheckedOutSession uses a ttl shorter than the
+// checkout deadline so the two exemptions don't overlap: LastSeen alone
 // would make this session look idle past the ttl, but a live, recent
 // checkout must still protect it from Sweep. Once released, the same
 // idle-past-ttl check evicts it normally.
 func TestSweepSkipsRecentCheckedOutSession(t *testing.T) {
-	st := NewStore(1*time.Minute, 20)
+	st := NewStore(1*time.Minute, 20, DefaultCheckoutDeadline, 20)
 	now := time.Now()
 
 	_, release, err := st.Checkout("busy", now)
@@ -196,7 +196,7 @@ func TestSweepSkipsRecentCheckedOutSession(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	later := now.Add(2 * time.Minute) // past the 1-minute ttl, well under CheckoutDeadline
+	later := now.Add(2 * time.Minute) // past the 1-minute ttl, well under the checkout deadline
 	if removed := st.Sweep(later); removed != 0 {
 		t.Errorf("Sweep removed %d for a live, non-stuck checkout, want 0", removed)
 	}
@@ -216,11 +216,11 @@ func TestSweepSkipsRecentCheckedOutSession(t *testing.T) {
 
 // TestSweepForceEvictsStuckCheckout covers the leak this round closes: a
 // checkout that is never released (a caller stuck on a slow upstream read,
-// say) must still age out once it has outstayed CheckoutDeadline, rather
-// than bricking that session id forever. The ForcedEvictions counter is the
-// operator-visible signal that this path fired.
+// say) must still age out once it has outstayed the checkout deadline,
+// rather than bricking that session id forever. The ForcedEvictions counter
+// is the operator-visible signal that this path fired.
 func TestSweepForceEvictsStuckCheckout(t *testing.T) {
-	st := NewStore(30*time.Minute, 20)
+	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
 	t0 := time.Now()
 
 	_, release1, err := st.Checkout("stuck", t0)
@@ -228,7 +228,7 @@ func TestSweepForceEvictsStuckCheckout(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	past := t0.Add(CheckoutDeadline + time.Minute)
+	past := t0.Add(DefaultCheckoutDeadline + time.Minute)
 	if removed := st.Sweep(past); removed != 1 {
 		t.Errorf("Sweep removed %d, want 1 (stuck checkout past deadline)", removed)
 	}
@@ -265,7 +265,7 @@ func TestSweepForceEvictsStuckCheckout(t *testing.T) {
 }
 
 func TestSweepEvictsIdleSessions(t *testing.T) {
-	st := NewStore(30*time.Minute, 20)
+	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
 	now := time.Now()
 
 	_, releaseFresh, err := st.Checkout("fresh", now)
@@ -292,7 +292,7 @@ func TestSweepEvictsIdleSessions(t *testing.T) {
 // called after its session was evicted and a fresh one took the same id,
 // must not clobber the fresh session's history.
 func TestReleaseCannotResurrectEvictedSession(t *testing.T) {
-	st := NewStore(30*time.Minute, 20)
+	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
 	t0 := time.Now()
 
 	sess1, release1, err := st.Checkout("abc", t0)
@@ -333,7 +333,7 @@ func TestReleaseCannotResurrectEvictedSession(t *testing.T) {
 // completes guarantees the goroutine has already picked the tick branch, and
 // waiting on done guarantees Sweep ran before we inspect the store.
 func TestSweeperRunsOnTick(t *testing.T) {
-	st := NewStore(30*time.Minute, 20)
+	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
 	base := time.Now()
 
 	_, release, err := st.Checkout("stale", base.Add(-31*time.Minute))
@@ -357,4 +357,100 @@ func TestSweeperRunsOnTick(t *testing.T) {
 	if st.Len() != 0 {
 		t.Errorf("Len() = %d after sweeper tick, want 0", st.Len())
 	}
+}
+
+// TestCheckoutEvictsLRUIdleSessionAtCapacity guards the map-growth fix: a
+// brand-new id arriving at capacity must evict the least-recently-seen idle
+// session rather than refuse the new visitor.
+func TestCheckoutEvictsLRUIdleSessionAtCapacity(t *testing.T) {
+	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 2)
+	now := time.Now()
+
+	_, releaseA, err := st.Checkout("a", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseA()
+
+	_, releaseB, err := st.Checkout("b", now.Add(time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseB()
+
+	// At capacity (2), both idle, "a" is the older of the two.
+	_, releaseC, err := st.Checkout("c", now.Add(2*time.Minute))
+	if err != nil {
+		t.Fatalf("checkout at capacity should evict the LRU idle session, got %v", err)
+	}
+	releaseC()
+
+	if st.Len() != 2 {
+		t.Errorf("Len() = %d, want 2 after eviction", st.Len())
+	}
+	if _, ok := st.sessions["a"]; ok {
+		t.Error("expected the LRU session \"a\" to have been evicted")
+	}
+	if _, ok := st.sessions["b"]; !ok {
+		t.Error("expected the more-recently-seen session \"b\" to survive eviction")
+	}
+}
+
+// TestCheckoutNeverEvictsCheckedOutSession guards the invariant that a
+// checked-out session is never evicted, even under capacity pressure: with
+// one checked-out and one idle session at capacity, the idle one must be
+// the one to go.
+func TestCheckoutNeverEvictsCheckedOutSession(t *testing.T) {
+	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 2)
+	now := time.Now()
+
+	_, releaseBusy, err := st.Checkout("busy", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// "busy" stays checked out for the rest of the test.
+
+	_, releaseIdle, err := st.Checkout("idle", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseIdle()
+
+	_, releaseFresh, err := st.Checkout("fresh", now.Add(time.Minute))
+	if err != nil {
+		t.Fatalf("checkout should evict the idle session to make room, got %v", err)
+	}
+	releaseFresh()
+
+	if _, ok := st.sessions["busy"]; !ok {
+		t.Error("checked-out session must never be evicted")
+	}
+	if _, ok := st.sessions["idle"]; ok {
+		t.Error("idle session should have been evicted, not \"busy\"")
+	}
+
+	releaseBusy()
+}
+
+// TestCheckoutReturnsErrStoreFullWhenAllCheckedOut covers the refusal path:
+// at capacity with every existing session checked out, there is nothing
+// idle to evict, so a brand-new id must be refused rather than starved
+// forever waiting for room.
+func TestCheckoutReturnsErrStoreFullWhenAllCheckedOut(t *testing.T) {
+	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 1)
+	now := time.Now()
+
+	_, release, err := st.Checkout("busy", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, _, err := st.Checkout("new", now.Add(time.Minute)); !errors.Is(err, ErrStoreFull) {
+		t.Errorf("checkout at capacity with only a checked-out session = %v, want ErrStoreFull", err)
+	}
+	if st.Len() != 1 {
+		t.Errorf("Len() = %d, want 1 (checked-out session must survive)", st.Len())
+	}
+
+	release()
 }

@@ -4,17 +4,19 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
 
+// testOptions mirrors the worker's own policy, which leaves MaxMemory unset;
+// the tests that care about it set it themselves.
 func testOptions(t *testing.T, workspace string) Options {
 	t.Helper()
 	return Options{
 		Workspace:    workspace,
 		ListenPort:   9000,
-		MaxMemory:    "192M",
 		MaxProcesses: 16,
 		MaxOpenFiles: 256,
 		MaxCPU:       50,
@@ -90,6 +92,55 @@ func TestPolicyRestrictsEgress(t *testing.T) {
 			t.Errorf("%s must be unreachable (expect http_code 000), got %q", target, got)
 		}
 	}
+}
+
+// TestPolicyStartsGoChild is the regression for a policy that the worker
+// could never run under: sandlock enforces MaxMemory by summing anonymous
+// mmap lengths, and the Go runtime reserves its heap arenas up front, so any
+// MaxMemory kills a Go child before main. The test binary is itself a Go
+// program, so re-running one trivial test under the policy is the cheapest
+// honest check that the worker can start.
+func TestPolicyStartsGoChild(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The workspace grant is what makes the test binary readable/executable.
+	opts := testOptions(t, filepath.Dir(exe))
+	opts.MaxMemory = ""
+	sb := Policy(opts)
+	// This binary loads libsandlock_ffi through an rpath into the checkout,
+	// where the deployed worker loads it from a directory the policy already
+	// covers.
+	sb.FSReadable = append(sb.FSReadable, ffiLibDir(t))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	res, err := sb.Run(ctx, exe, "-test.run=^TestGoChildStarts$", "-test.count=1")
+	if err != nil {
+		t.Fatalf("running the Go child: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("a Go child must start under the worker policy, got exit=%d stdout=%q stderr=%q",
+			res.ExitCode, res.Stdout, res.Stderr)
+	}
+}
+
+// TestGoChildStarts is the body TestPolicyStartsGoChild re-execs under the
+// sandbox. Reaching it is the whole assertion.
+func TestGoChildStarts(t *testing.T) {}
+
+// ffiLibDir is the checkout's cargo output directory, which the sandlock_repo
+// build tag rpaths into every binary in this module.
+func ffiLibDir(t *testing.T) string {
+	t.Helper()
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("locating this test's source file")
+	}
+	return filepath.Join(filepath.Dir(thisFile), "..", "..", "third_party", "sandlock", "target", "release")
 }
 
 // TestPolicyEnforcesMemoryLimit guards the resource cap that protects the

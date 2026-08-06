@@ -13,8 +13,13 @@ const MoonshotHostPort = "api.moonshot.ai:443"
 
 // Options describes the confinement the worker runs under.
 type Options struct {
-	Workspace    string // absolute path to the read-only content directory
-	ListenPort   int
+	Workspace  string // absolute path to the read-only content directory
+	ListenPort int
+	// MaxMemory is a sandlock byte-size ("64M"); "" leaves it unset. It is
+	// enforced by summing the length of every anonymous mmap, which a Go
+	// child cannot survive: the runtime reserves its heap arenas up front, so
+	// any limit smaller than that reservation kills the process at startup.
+	// Leave it unset for Go children and cap their memory with a cgroup.
 	MaxMemory    string
 	MaxProcesses uint32
 	MaxOpenFiles uint32

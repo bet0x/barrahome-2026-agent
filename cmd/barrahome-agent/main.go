@@ -71,14 +71,7 @@ func supervise() error {
 		return fmt.Errorf("locating own binary: %w", err)
 	}
 
-	sb := sandbox.Policy(sandbox.Options{
-		Workspace:    cfg.Workspace,
-		ListenPort:   cfg.ListenPort,
-		MaxMemory:    "192M",
-		MaxProcesses: 16,
-		MaxOpenFiles: 256,
-		MaxCPU:       50,
-	})
+	sb := sandbox.Policy(workerPolicy(cfg))
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -92,6 +85,22 @@ func supervise() error {
 		return fmt.Errorf("worker exited with code %d", code)
 	}
 	return nil
+}
+
+// workerPolicy describes the worker's confinement.
+//
+// MaxMemory is deliberately unset: sandlock enforces it by summing anonymous
+// mmap lengths, and the Go runtime's up-front arena reservation exceeds any
+// sane limit, so the worker is killed before it runs (see sandbox.Options).
+// The container's cgroup limit is what caps the worker's memory.
+func workerPolicy(cfg *config.Config) sandbox.Options {
+	return sandbox.Options{
+		Workspace:    cfg.Workspace,
+		ListenPort:   cfg.ListenPort,
+		MaxProcesses: 16,
+		MaxOpenFiles: 256,
+		MaxCPU:       50,
+	}
 }
 
 // serve runs the HTTP server. It is the process that is actually confined.

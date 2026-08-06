@@ -10,8 +10,27 @@ import (
 	"github.com/bet0x/barrahome-2026-agent/internal/moonshot"
 )
 
+// TestNewStoreZeroConfigUsesDefaults guards Config's fallback behavior: a
+// caller that only cares about one field must still get sane values for
+// the rest, not zero TTL/MaxTurns/MaxSessions that would reject everything.
+func TestNewStoreZeroConfigUsesDefaults(t *testing.T) {
+	st := NewStore(Config{})
+	if st.ttl != DefaultTTL {
+		t.Errorf("ttl = %v, want %v", st.ttl, DefaultTTL)
+	}
+	if st.maxTurns != DefaultMaxTurns {
+		t.Errorf("maxTurns = %v, want %v", st.maxTurns, DefaultMaxTurns)
+	}
+	if st.checkoutDeadline != DefaultCheckoutDeadline {
+		t.Errorf("checkoutDeadline = %v, want %v", st.checkoutDeadline, DefaultCheckoutDeadline)
+	}
+	if st.maxSessions != DefaultMaxSessions {
+		t.Errorf("maxSessions = %v, want %v", st.maxSessions, DefaultMaxSessions)
+	}
+}
+
 func TestCheckoutPreservesHistory(t *testing.T) {
-	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 20})
 	now := time.Now()
 
 	s1, release1, err := st.Checkout("abc", now)
@@ -35,7 +54,7 @@ func TestCheckoutPreservesHistory(t *testing.T) {
 }
 
 func TestCheckoutTurnLimit(t *testing.T) {
-	st := NewStore(30*time.Minute, 2, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 2, MaxSessions: 20})
 	now := time.Now()
 
 	for i := 0; i < 2; i++ {
@@ -51,7 +70,7 @@ func TestCheckoutTurnLimit(t *testing.T) {
 }
 
 func TestCheckoutRefusesConcurrentSameSession(t *testing.T) {
-	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 20})
 	now := time.Now()
 
 	_, release, err := st.Checkout("abc", now)
@@ -77,7 +96,7 @@ func TestCheckoutRefusesConcurrentSameSession(t *testing.T) {
 // caller that writes it immediately after Checkout, before checking err,
 // must not panic on the ErrSessionBusy or ErrTurnLimit paths.
 func TestErrorPathsReturnUsableRelease(t *testing.T) {
-	st := NewStore(30*time.Minute, 1, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 1, MaxSessions: 20})
 	now := time.Now()
 
 	_, release, err := st.Checkout("abc", now)
@@ -111,7 +130,7 @@ func TestErrorPathsReturnUsableRelease(t *testing.T) {
 // out from under it. Without idempotency, the second call here would free
 // "abc" for a third party while B still believes it holds it exclusively.
 func TestReleaseIsIdempotent(t *testing.T) {
-	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 20})
 	now := time.Now()
 
 	_, releaseA, err := st.Checkout("abc", now)
@@ -142,7 +161,7 @@ func TestConcurrentCheckoutRespectsTurnCap(t *testing.T) {
 	const maxTurns = 3
 	const workers = 20
 
-	st := NewStore(30*time.Minute, maxTurns, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: maxTurns, MaxSessions: 20})
 	now := time.Now()
 
 	// Bounded, not "for {}": if a regression ever makes release stop
@@ -188,7 +207,7 @@ func TestConcurrentCheckoutRespectsTurnCap(t *testing.T) {
 // checkout must still protect it from Sweep. Once released, the same
 // idle-past-ttl check evicts it normally.
 func TestSweepSkipsRecentCheckedOutSession(t *testing.T) {
-	st := NewStore(1*time.Minute, 20, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 1 * time.Minute, MaxTurns: 20, MaxSessions: 20})
 	now := time.Now()
 
 	_, release, err := st.Checkout("busy", now)
@@ -220,7 +239,7 @@ func TestSweepSkipsRecentCheckedOutSession(t *testing.T) {
 // rather than bricking that session id forever. The ForcedEvictions counter
 // is the operator-visible signal that this path fired.
 func TestSweepForceEvictsStuckCheckout(t *testing.T) {
-	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 20})
 	t0 := time.Now()
 
 	_, release1, err := st.Checkout("stuck", t0)
@@ -265,7 +284,7 @@ func TestSweepForceEvictsStuckCheckout(t *testing.T) {
 }
 
 func TestSweepEvictsIdleSessions(t *testing.T) {
-	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 20})
 	now := time.Now()
 
 	_, releaseFresh, err := st.Checkout("fresh", now)
@@ -292,7 +311,7 @@ func TestSweepEvictsIdleSessions(t *testing.T) {
 // called after its session was evicted and a fresh one took the same id,
 // must not clobber the fresh session's history.
 func TestReleaseCannotResurrectEvictedSession(t *testing.T) {
-	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 20})
 	t0 := time.Now()
 
 	sess1, release1, err := st.Checkout("abc", t0)
@@ -333,7 +352,7 @@ func TestReleaseCannotResurrectEvictedSession(t *testing.T) {
 // completes guarantees the goroutine has already picked the tick branch, and
 // waiting on done guarantees Sweep ran before we inspect the store.
 func TestSweeperRunsOnTick(t *testing.T) {
-	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 20)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 20})
 	base := time.Now()
 
 	_, release, err := st.Checkout("stale", base.Add(-31*time.Minute))
@@ -363,7 +382,7 @@ func TestSweeperRunsOnTick(t *testing.T) {
 // brand-new id arriving at capacity must evict the least-recently-seen idle
 // session rather than refuse the new visitor.
 func TestCheckoutEvictsLRUIdleSessionAtCapacity(t *testing.T) {
-	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 2)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 2})
 	now := time.Now()
 
 	_, releaseA, err := st.Checkout("a", now)
@@ -401,7 +420,7 @@ func TestCheckoutEvictsLRUIdleSessionAtCapacity(t *testing.T) {
 // one checked-out and one idle session at capacity, the idle one must be
 // the one to go.
 func TestCheckoutNeverEvictsCheckedOutSession(t *testing.T) {
-	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 2)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 2})
 	now := time.Now()
 
 	_, releaseBusy, err := st.Checkout("busy", now)
@@ -437,7 +456,7 @@ func TestCheckoutNeverEvictsCheckedOutSession(t *testing.T) {
 // idle to evict, so a brand-new id must be refused rather than starved
 // forever waiting for room.
 func TestCheckoutReturnsErrStoreFullWhenAllCheckedOut(t *testing.T) {
-	st := NewStore(30*time.Minute, 20, DefaultCheckoutDeadline, 1)
+	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 1})
 	now := time.Now()
 
 	_, release, err := st.Checkout("busy", now)

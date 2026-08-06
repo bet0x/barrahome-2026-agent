@@ -25,23 +25,23 @@ var ErrSessionBusy = errors.New("session already in use")
 // once, which bounds how much of the store this can ever apply to.
 var ErrStoreFull = errors.New("session store full")
 
-// DefaultCheckoutDeadline is a sensible default for the checkoutDeadline
-// passed to NewStore: how long a checkout may stay outstanding before Sweep
-// force-evicts it. Without this, a stuck caller — e.g. blocked forever on
-// an upstream read — bricks its session id for that visitor permanently:
-// the entry never ages out and every later request 409s.
-const DefaultCheckoutDeadline = 5 * time.Minute
+// Defaults for Config's fields, used when a field is left zero.
+// DefaultMaxSessions is sized to match the sandbox's own MaxMemory budget.
+const (
+	DefaultTTL              = 30 * time.Minute
+	DefaultMaxTurns         = 20
+	DefaultCheckoutDeadline = 5 * time.Minute
+	DefaultMaxSessions      = 100
+)
 
-// DefaultMaxSessions is a sensible default for the maxSessions passed to
-// NewStore. Session ids are client-supplied on a public, unauthenticated
-// endpoint, so nothing else bounds how many distinct sessions accumulate;
-// each can carry up to MaxTurns turns of history with tool results capped
-// at 64KB apiece (~1.3MB per session worst case at the default MaxTurns of
-// 20). 100 sessions puts the worst-case ceiling on session memory at
-// roughly 128MB — the same order of magnitude as the sandbox's own 192M
-// MaxMemory budget, so a flood of live sessions can no longer contend with
-// it for the host's memory unboundedly.
-const DefaultMaxSessions = 100
+// Config configures a Store; a zero field falls back to its default. A
+// struct avoids two same-typed Duration args being swappable at a call site.
+type Config struct {
+	TTL              time.Duration
+	MaxTurns         int
+	CheckoutDeadline time.Duration
+	MaxSessions      int
+}
 
 // Session is one visitor's conversation. Nothing is persisted to disk.
 type Session struct {
@@ -72,19 +72,26 @@ type Store struct {
 	forcedEvictions  int
 }
 
-// NewStore returns a store evicting idle sessions after ttl and capping each
-// session at maxTurns checkouts. checkoutDeadline bounds how long a checkout
-// may stay outstanding before Sweep force-evicts it (see
-// DefaultCheckoutDeadline). maxSessions caps the number of live sessions;
-// once at capacity, Checkout evicts the least-recently-seen idle session to
-// make room rather than refusing the visitor (see DefaultMaxSessions).
-func NewStore(ttl time.Duration, maxTurns int, checkoutDeadline time.Duration, maxSessions int) *Store {
+// NewStore returns a store per cfg, filling zero fields with their defaults.
+func NewStore(cfg Config) *Store {
+	if cfg.TTL == 0 {
+		cfg.TTL = DefaultTTL
+	}
+	if cfg.MaxTurns == 0 {
+		cfg.MaxTurns = DefaultMaxTurns
+	}
+	if cfg.CheckoutDeadline == 0 {
+		cfg.CheckoutDeadline = DefaultCheckoutDeadline
+	}
+	if cfg.MaxSessions == 0 {
+		cfg.MaxSessions = DefaultMaxSessions
+	}
 	return &Store{
 		sessions:         make(map[string]*entry),
-		ttl:              ttl,
-		maxTurns:         maxTurns,
-		checkoutDeadline: checkoutDeadline,
-		maxSessions:      maxSessions,
+		ttl:              cfg.TTL,
+		maxTurns:         cfg.MaxTurns,
+		checkoutDeadline: cfg.CheckoutDeadline,
+		maxSessions:      cfg.MaxSessions,
 	}
 }
 

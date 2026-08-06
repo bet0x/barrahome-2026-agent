@@ -10,19 +10,18 @@ import (
 // ErrPerIPQuota is returned when an IP has used its hourly allowance.
 var ErrPerIPQuota = errors.New("per-IP quota exceeded")
 
-// ErrBusy is returned when the global concurrency cap is saturated. Callers
-// must reject rather than queue, so a traffic spike cannot pile up unbounded
-// upstream requests.
+// ErrBusy is returned when the global concurrency cap is saturated; callers
+// must reject rather than queue so a spike can't pile up upstream requests.
 var ErrBusy = errors.New("too many concurrent requests")
 
-// ipWindow is one IP's rolling hourly quota window.
+// ipWindow is one IP's hourly quota window, reset on a fixed clock boundary
+// rather than a sliding one.
 type ipWindow struct {
 	count int
 	start time.Time
 }
 
-// Limiter enforces a rolling per-IP hourly quota and a global cap on the
-// number of in-flight upstream streams.
+// Limiter enforces a per-IP hourly quota and a global concurrency cap.
 type Limiter struct {
 	mu            sync.Mutex
 	perIP         map[string]*ipWindow
@@ -40,11 +39,9 @@ func NewLimiter(perIPPerHour, maxConcurrent int) *Limiter {
 	}
 }
 
-// Acquire reserves capacity for one request from ip. The quota check, the
-// concurrency check and both counter increments happen under a single lock,
-// so two concurrent callers can never both observe a slot as free and both
-// take it. The returned release must be called when the request finishes;
-// calling it more than once is safe.
+// Acquire reserves capacity for one request from ip, checking and
+// incrementing both counters under one lock so two callers can never both
+// see a slot as free. release is idempotent and must be called when done.
 func (l *Limiter) Acquire(ip string, now time.Time) (func(), error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -76,8 +73,7 @@ func (l *Limiter) Acquire(ip string, now time.Time) (func(), error) {
 	}, nil
 }
 
-// Sweep drops per-IP windows that have rolled over, bounding perIP's growth
-// as distinct IPs come and go. It returns how many windows were removed.
+// Sweep drops per-IP windows that have rolled over and returns how many.
 func (l *Limiter) Sweep(now time.Time) int {
 	l.mu.Lock()
 	defer l.mu.Unlock()

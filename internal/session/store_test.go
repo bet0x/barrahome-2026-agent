@@ -69,6 +69,35 @@ func TestCheckoutTurnLimit(t *testing.T) {
 	}
 }
 
+// TestCheckoutReportsTurnsLeft covers the count callers report to visitors,
+// including the case where the store's default cap applies because Config
+// left MaxTurns at zero.
+func TestCheckoutReportsTurnsLeft(t *testing.T) {
+	st := NewStore(Config{MaxTurns: 3})
+	now := time.Now()
+
+	for i, want := range []int{2, 1, 0} {
+		sess, release, err := st.Checkout("abc", now)
+		if err != nil {
+			t.Fatalf("turn %d: %v", i, err)
+		}
+		if sess.TurnsLeft != want {
+			t.Errorf("turn %d: TurnsLeft = %d, want %d", i, sess.TurnsLeft, want)
+		}
+		release()
+	}
+
+	defaulted := NewStore(Config{})
+	sess, release, err := defaulted.Checkout("abc", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if want := DefaultMaxTurns - 1; sess.TurnsLeft != want {
+		t.Errorf("TurnsLeft under the default cap = %d, want %d", sess.TurnsLeft, want)
+	}
+}
+
 func TestCheckoutRefusesConcurrentSameSession(t *testing.T) {
 	st := NewStore(Config{TTL: 30 * time.Minute, MaxTurns: 20, MaxSessions: 20})
 	now := time.Now()

@@ -162,9 +162,8 @@ func (d Deps) handleStream(w http.ResponseWriter, r *http.Request) {
 	// The turn was already spent by Checkout; only the history is ours to
 	// write, and only until releaseSession runs.
 	sess.Messages = history
-	turnsLeft := d.Cfg.MaxTurns - sess.Turns
 
-	_ = send("done", map[string]any{"turns_left": turnsLeft})
+	_ = send("done", map[string]any{"turns_left": sess.TurnsLeft})
 }
 
 func (d Deps) originAllowed(origin string) bool {

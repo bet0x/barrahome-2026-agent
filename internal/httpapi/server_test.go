@@ -50,7 +50,7 @@ type stubTools struct{}
 
 func (stubTools) Call(string, string) string { return "unused" }
 
-func newTestDeps(t *testing.T, perIPPerHour, maxConcurrent int) (Deps, *config.Config) {
+func newTestDeps(t *testing.T, perIPPerHour, maxConcurrent int) Deps {
 	t.Helper()
 	cfg := &config.Config{
 		AllowedOrigins: []string{"https://barrahome.org"},
@@ -65,13 +65,12 @@ func newTestDeps(t *testing.T, perIPPerHour, maxConcurrent int) (Deps, *config.C
 		Model:    &stubModel{reply: "hola desde el agente"},
 		Sessions: session.NewStore(session.Config{TTL: cfg.SessionTTL, MaxTurns: cfg.MaxTurns}),
 		Limiter:  limits.NewLimiter(perIPPerHour, maxConcurrent),
-	}, cfg
+	}
 }
 
 func newTestServer(t *testing.T, perIPPerHour, maxConcurrent int) http.Handler {
 	t.Helper()
-	d, _ := newTestDeps(t, perIPPerHour, maxConcurrent)
-	return NewServer(d)
+	return NewServer(newTestDeps(t, perIPPerHour, maxConcurrent))
 }
 
 func post(t *testing.T, h http.Handler, origin, body string) *httptest.ResponseRecorder {
@@ -271,7 +270,7 @@ func TestStreamEnforcesPerIPQuota(t *testing.T) {
 // guarantee end-to-end: a second request for a session already mid-stream
 // must be refused with 409, not queued behind the first.
 func TestStreamRejectsConcurrentSameSession(t *testing.T) {
-	d, _ := newTestDeps(t, 20, 10)
+	d := newTestDeps(t, 20, 10)
 	model := &blockingModel{started: make(chan struct{}), proceed: make(chan struct{})}
 	d.Model = model
 	h := NewServer(d)

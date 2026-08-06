@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -30,25 +31,41 @@ import (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
+	os.Exit(run(os.Args, os.Stderr))
+}
 
-	mode := "serve"
-	if len(os.Args) > 1 {
-		mode = os.Args[1]
+// run dispatches argv's subcommand and returns the process exit code. The
+// subcommand is mandatory and has no default: "serve" is the unconfined
+// worker, so a container entrypoint that lost its argument must fail loudly
+// rather than start the agent outside the sandbox.
+func run(argv []string, stderr io.Writer) int {
+	name := "barrahome-agent"
+	if len(argv) > 0 {
+		name = argv[0]
+	}
+	usage := func() int {
+		fmt.Fprintf(stderr, "usage: %s <supervise|serve>\n", name)
+		return 2
+	}
+	if len(argv) < 2 {
+		return usage()
 	}
 
-	switch mode {
+	switch argv[1] {
 	case "supervise":
 		if err := supervise(); err != nil {
-			log.Fatalf("supervise: %v", err)
+			log.Printf("supervise: %v", err)
+			return 1
 		}
 	case "serve":
 		if err := serve(); err != nil {
-			log.Fatalf("serve: %v", err)
+			log.Printf("serve: %v", err)
+			return 1
 		}
 	default:
-		fmt.Fprintf(os.Stderr, "usage: %s [supervise|serve]\n", os.Args[0])
-		os.Exit(2)
+		return usage()
 	}
+	return 0
 }
 
 // supervise applies the sandbox policy and runs the worker under it. If the

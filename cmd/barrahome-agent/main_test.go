@@ -1,10 +1,31 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/bet0x/barrahome-2026-agent/internal/config"
 )
+
+// TestRunRequiresSubcommand pins the entrypoint guard: "serve" is the
+// unconfined worker, so an empty or unknown argv must exit 2 with usage
+// instead of starting it. Exit code 2 also distinguishes this from a failed
+// serve, which returns 1.
+func TestRunRequiresSubcommand(t *testing.T) {
+	for _, argv := range [][]string{
+		{"barrahome-agent"},
+		{"barrahome-agent", "srve"},
+		{"barrahome-agent", ""},
+	} {
+		var stderr strings.Builder
+		if code := run(argv, &stderr); code != 2 {
+			t.Errorf("run(%q) = %d, want 2", argv, code)
+		}
+		if !strings.Contains(stderr.String(), "usage:") {
+			t.Errorf("run(%q) stderr = %q, want usage", argv, stderr.String())
+		}
+	}
+}
 
 // TestWorkerPolicyHasNoMemoryLimit guards Critical 2: sandlock's MaxMemory is
 // enforced over anonymous mmap length, which kills a Go child during its

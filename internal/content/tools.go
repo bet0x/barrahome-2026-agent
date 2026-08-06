@@ -31,6 +31,19 @@ type Tools struct {
 // NewTools returns tools rooted at r.
 func NewTools(r *Resolver) *Tools { return &Tools{r: r} }
 
+// describeOSError classifies a filesystem error without repeating its text,
+// which for *fs.PathError embeds the resolved absolute host path.
+func describeOSError(err error) string {
+	switch {
+	case os.IsNotExist(err):
+		return "file not found"
+	case os.IsPermission(err):
+		return "permission denied"
+	default:
+		return "unavailable"
+	}
+}
+
 // ListDir lists the entries of a directory relative to the content root.
 // Directories are suffixed with "/" so the model can navigate without guessing.
 func (t *Tools) ListDir(rel string) (string, error) {
@@ -40,7 +53,7 @@ func (t *Tools) ListDir(rel string) (string, error) {
 	}
 	entries, err := os.ReadDir(abs)
 	if err != nil {
-		return "", fmt.Errorf("cannot list %q: %w", rel, err)
+		return "", fmt.Errorf("cannot list %q: %s", rel, describeOSError(err))
 	}
 
 	names := make([]string, 0, len(entries))
@@ -67,29 +80,37 @@ func (t *Tools) ReadFile(rel string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Stat only to reject directories and non-regular files (FIFOs, sockets,
+	// devices) before opening — opening a FIFO with no writer blocks forever.
 	info, err := os.Stat(abs)
 	if err != nil {
-		return "", fmt.Errorf("cannot read %q: %w", rel, err)
+		return "", fmt.Errorf("cannot read %q: %s", rel, describeOSError(err))
 	}
 	if info.IsDir() {
 		return "", fmt.Errorf("%q is a directory, not a file", rel)
 	}
+	if !info.Mode().IsRegular() {
+		return "", fmt.Errorf("%q is not a regular file", rel)
+	}
 
 	f, err := os.Open(abs)
 	if err != nil {
-		return "", fmt.Errorf("cannot read %q: %w", rel, err)
+		return "", fmt.Errorf("cannot read %q: %s", rel, describeOSError(err))
 	}
 	defer f.Close()
 
-	buf, err := io.ReadAll(io.LimitReader(f, MaxFileBytes))
+	// Read one byte past the cap and decide truncation from what was
+	// actually read, not from the stat above: the file can grow between
+	// the two calls, and a size caught before that growth would otherwise
+	// describe a truncated read as complete.
+	buf, err := io.ReadAll(io.LimitReader(f, MaxFileBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("cannot read %q: %w", rel, err)
+		return "", fmt.Errorf("cannot read %q: %s", rel, describeOSError(err))
 	}
-	out := string(buf)
-	if info.Size() > MaxFileBytes {
-		out += fmt.Sprintf("\n\n[truncated: showing %d of %d bytes]", len(buf), info.Size())
+	if len(buf) > MaxFileBytes {
+		return string(buf[:MaxFileBytes]) + fmt.Sprintf("\n\n[truncated: showing the first %d bytes]", MaxFileBytes), nil
 	}
-	return out, nil
+	return string(buf), nil
 }
 
 // SearchContent does a case-insensitive substring search across the content
@@ -113,6 +134,11 @@ func (t *Tools) SearchContent(query string) (string, error) {
 			if strings.HasPrefix(d.Name(), ".") && path != t.r.Root() {
 				return fs.SkipDir
 			}
+			return nil
+		}
+		// Match ListDir's visibility model: dotfiles (.env and friends)
+		// stay hidden from search results too.
+		if strings.HasPrefix(d.Name(), ".") {
 			return nil
 		}
 		info, err := d.Info()

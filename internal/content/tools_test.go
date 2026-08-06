@@ -4,7 +4,9 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 )
 
 func newTestTools(t *testing.T) (*Tools, string) {
@@ -87,6 +89,110 @@ func TestReadFileTruncatesLargeFiles(t *testing.T) {
 	}
 	if !strings.Contains(out, "truncated") {
 		t.Errorf("truncated output should say so, got tail %q", out[max(0, len(out)-80):])
+	}
+}
+
+func TestReadFileErrorHidesAbsolutePath(t *testing.T) {
+	tools, root := newTestTools(t)
+
+	_, err := tools.ReadFile("missing.md")
+	if err == nil {
+		t.Fatal("ReadFile(missing.md) should fail")
+	}
+	if strings.Contains(err.Error(), root) {
+		t.Errorf("ReadFile error leaked the absolute content root: %v", err)
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "not found") {
+		t.Errorf("ReadFile error = %v, want it to say the file was not found", err)
+	}
+}
+
+// TestReadFileTruncationSurvivesConcurrentGrowth reproduces the grow-after-stat
+// race: a file grows past MaxFileBytes between the Stat and the Read inside
+// ReadFile. The truncation notice must depend only on what was actually read,
+// never on the pre-read Stat, so the invariant below must hold on every call
+// regardless of how far the concurrent writer has gotten.
+func TestReadFileTruncationSurvivesConcurrentGrowth(t *testing.T) {
+	tools, root := newTestTools(t)
+	path := filepath.Join(root, "growing.md")
+	if err := os.WriteFile(path, []byte(strings.Repeat("z", 10)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+		if err != nil {
+			return
+		}
+		defer f.Close()
+		chunk := []byte(strings.Repeat("z", 4096))
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				f.Write(chunk)
+			}
+		}
+	}()
+
+	for i := 0; i < 200; i++ {
+		out, err := tools.ReadFile("growing.md")
+		if err != nil {
+			t.Fatalf("ReadFile: %v", err)
+		}
+		// A body landing exactly on the cap with no notice is the signature
+		// of the old bug: the file already had more bytes at read time, but
+		// a stat taken before the growth said otherwise.
+		if len(out) == MaxFileBytes && !strings.Contains(out, "truncated") {
+			t.Fatalf("iteration %d: returned exactly %d bytes with no truncation notice", i, MaxFileBytes)
+		}
+	}
+	close(stop)
+	<-done
+}
+
+func TestReadFileRejectsFIFO(t *testing.T) {
+	tools, root := newTestTools(t)
+	fifoPath := filepath.Join(root, "pipe")
+	if err := syscall.Mkfifo(fifoPath, 0o600); err != nil {
+		t.Skipf("cannot create a FIFO on this platform: %v", err)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		_, err := tools.ReadFile("pipe")
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if err == nil {
+			t.Error("ReadFile(pipe) should fail instead of returning FIFO contents")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ReadFile blocked on a FIFO instead of rejecting it up front")
+	}
+}
+
+func TestSearchContentSkipsDotfiles(t *testing.T) {
+	tools, root := newTestTools(t)
+	if err := os.WriteFile(filepath.Join(root, ".env"), []byte("SECRET_TOKEN=abc123"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := tools.SearchContent("SECRET_TOKEN")
+	if err != nil {
+		t.Fatalf("SearchContent: %v", err)
+	}
+	if strings.Contains(out, ".env") {
+		t.Errorf("SearchContent leaked a dotfile: %q", out)
+	}
+	if !strings.Contains(strings.ToLower(out), "no match") {
+		t.Errorf("SearchContent = %q, want no matches reported", out)
 	}
 }
 

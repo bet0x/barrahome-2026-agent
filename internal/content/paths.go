@@ -61,7 +61,10 @@ func (r *Resolver) Resolve(rel string) (string, error) {
 
 	real, err := resolveExistingAncestor(joined)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", ErrInvalidPath, err)
+		// Classify rather than pass the OS error through: it is an
+		// *fs.PathError over the resolved absolute path, and that must
+		// never reach the model or a visitor.
+		return "", fmt.Errorf("%w: %s", ErrInvalidPath, describeOSError(err))
 	}
 	joined = real
 

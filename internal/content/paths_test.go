@@ -93,3 +93,33 @@ func TestResolveRejectsSymlinkedParentEscape(t *testing.T) {
 		}
 	}
 }
+
+// TestResolveHidesPermissionErrorPath covers the case where an ancestor
+// directory exists but cannot be searched: EvalSymlinks then fails with
+// something other than os.IsNotExist, which used to be passed straight
+// through and embedded the absolute content root in the error text.
+func TestResolveHidesPermissionErrorPath(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission bits are ignored when running as root")
+	}
+	r, root := newTestResolver(t)
+	locked := filepath.Join(root, "locked")
+	if err := os.Mkdir(locked, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(locked, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(locked, 0o755) })
+
+	_, err := r.Resolve("locked/missingleaf.md")
+	if !errors.Is(err, ErrInvalidPath) {
+		t.Fatalf("Resolve(\"locked/missingleaf.md\") = %v, want ErrInvalidPath", err)
+	}
+	if strings.Contains(err.Error(), root) {
+		t.Errorf("Resolve error leaked the absolute content root: %v", err)
+	}
+	if strings.Contains(err.Error(), "lstat") {
+		t.Errorf("Resolve error leaked raw syscall text: %v", err)
+	}
+}

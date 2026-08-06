@@ -167,6 +167,9 @@ func (t *Tools) SearchContent(query string) (string, error) {
 		return nil
 	})
 	if err != nil {
+		// Defensive: the callback above only ever returns nil, fs.SkipDir or
+		// fs.SkipAll, so WalkDir cannot actually hand back a non-nil error
+		// here. Kept as a guard in case that callback ever changes.
 		return "", fmt.Errorf("search failed: %w", err)
 	}
 	if len(matches) == 0 {

@@ -94,7 +94,7 @@ func supervise() error {
 	defer stop()
 
 	log.Printf("supervising confined worker (workspace=%s port=%d)", cfg.Workspace, cfg.ListenPort)
-	code, err := sandbox.RunWorker(ctx, sb, self, "serve")
+	code, err := sandbox.RunWorker(ctx, sb, workerKillGrace(cfg), self, "serve")
 	if err != nil {
 		return err
 	}
@@ -102,6 +102,17 @@ func supervise() error {
 		return fmt.Errorf("worker exited with code %d", code)
 	}
 	return nil
+}
+
+// workerKillGraceMargin is added on top of the worker's own shutdown deadline
+// so the supervisor's SIGKILL never races the worker's own graceful drain.
+const workerKillGraceMargin = 10 * time.Second
+
+// workerKillGrace derives the worker's kill grace from its configured drain
+// deadline (rather than an independent constant), so the two cannot drift out
+// of sync if an operator raises BARRAHOME_SHUTDOWN_TIMEOUT_SEC.
+func workerKillGrace(cfg *config.Config) time.Duration {
+	return cfg.ShutdownTimeout + workerKillGraceMargin
 }
 
 // workerPolicy describes the worker's confinement.
@@ -161,7 +172,7 @@ func serve() error {
 	go func() {
 		defer close(drained)
 		<-ctx.Done()
-		shutdownCtx, done := context.WithTimeout(context.Background(), 10*time.Second)
+		shutdownCtx, done := context.WithTimeout(context.Background(), cfg.ShutdownTimeout)
 		defer done()
 		log.Printf("shutting down, draining in-flight requests")
 		_ = srv.Shutdown(shutdownCtx)

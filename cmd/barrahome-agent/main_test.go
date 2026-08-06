@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/bet0x/barrahome-2026-agent/internal/config"
 )
@@ -37,5 +38,18 @@ func TestWorkerPolicyHasNoMemoryLimit(t *testing.T) {
 	}
 	if opts.MaxProcesses == 0 || opts.MaxOpenFiles == 0 || opts.MaxCPU == 0 {
 		t.Errorf("the limits that do work must stay set: %+v", opts)
+	}
+}
+
+// TestWorkerKillGraceOutlastsShutdownTimeout pins the ordering that keeps the
+// supervisor's SIGKILL from racing the worker's own drain: whatever the
+// configured drain deadline is, the derived kill grace must stay strictly
+// longer, with no independent constant to fall out of sync.
+func TestWorkerKillGraceOutlastsShutdownTimeout(t *testing.T) {
+	for _, timeout := range []time.Duration{10 * time.Second, 30 * time.Second, 90 * time.Second} {
+		cfg := &config.Config{ShutdownTimeout: timeout}
+		if got := workerKillGrace(cfg); got <= timeout {
+			t.Errorf("workerKillGrace(%v) = %v, want strictly more than the drain deadline", timeout, got)
+		}
 	}
 }

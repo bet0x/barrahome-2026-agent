@@ -56,20 +56,18 @@ func Policy(opts Options) *sandlock.Sandbox {
 	}
 }
 
-// workerKillGrace is how long the worker gets to finish draining after its
-// SIGTERM before it is killed. It must outlast the worker's own shutdown
-// window.
-const workerKillGrace = 15 * time.Second
-
 // RunWorker runs argv under the sandbox with the caller's stdio attached and
 // returns the child's exit code. An error means the policy could not be
 // applied; the caller must not fall back to running unconfined.
 //
 // When ctx is cancelled the worker is sent SIGTERM so it can drain, and
-// SIGKILL if it is still alive workerKillGrace later. RunInteractive is not
-// used: it only checks ctx on entry, so the worker would never learn that the
-// supervisor was asked to stop.
-func RunWorker(ctx context.Context, sb *sandlock.Sandbox, argv ...string) (int, error) {
+// SIGKILL if it is still alive killGrace later. killGrace must outlast the
+// worker's own shutdown deadline, or the supervisor kills it mid-drain — the
+// caller derives it from that deadline rather than picking an independent
+// constant that can drift out of sync. RunInteractive is not used: it only
+// checks ctx on entry, so the worker would never learn that the supervisor
+// was asked to stop.
+func RunWorker(ctx context.Context, sb *sandlock.Sandbox, killGrace time.Duration, argv ...string) (int, error) {
 	if len(argv) == 0 {
 		return 0, fmt.Errorf("sandbox: empty argv")
 	}
@@ -92,7 +90,7 @@ func RunWorker(ctx context.Context, sb *sandlock.Sandbox, argv ...string) (int, 
 		_ = syscall.Kill(-proc.Pid(), syscall.SIGTERM)
 		select {
 		case <-exited:
-		case <-time.After(workerKillGrace):
+		case <-time.After(killGrace):
 			_ = proc.Kill()
 		}
 	}()

@@ -32,6 +32,10 @@ services:
       - seccomp=unconfined
     mem_limit: 512m
     pids_limit: 128
+    # Must exceed the supervisor's worker-kill grace (BARRAHOME_SHUTDOWN_TIMEOUT_SEC
+    # + a 10s margin, computed in cmd/barrahome-agent), or Docker's SIGKILL races
+    # and wins against the app's own graceful drain. Raise both together.
+    stop_grace_period: 50s
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9000/healthz"]
       interval: 30s

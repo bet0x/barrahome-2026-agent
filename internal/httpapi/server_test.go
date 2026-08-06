@@ -16,7 +16,10 @@ import (
 	"github.com/bet0x/barrahome-2026-agent/internal/session"
 )
 
-type stubModel struct{ reply string }
+type stubModel struct {
+	reply string
+	usage *moonshot.Usage
+}
 
 func (s *stubModel) Stream(_ context.Context, _ []moonshot.Message,
 	_ []moonshot.ToolDef, _ int, onText func(string) error) (*moonshot.Message, error) {
@@ -25,7 +28,7 @@ func (s *stubModel) Stream(_ context.Context, _ []moonshot.Message,
 			return nil, err
 		}
 	}
-	return &moonshot.Message{Role: "assistant", Content: s.reply}, nil
+	return &moonshot.Message{Role: "assistant", Content: s.reply, Usage: s.usage}, nil
 }
 
 // blockingModel lets a test hold a request open until it chooses to release
@@ -420,5 +423,42 @@ func TestHealthz(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Errorf("healthz status = %d, want 200", rec.Code)
+	}
+}
+
+// TestHealthzReportsUsageAfterATurn guards the operational-visibility point
+// of the whole usage feature: a completed turn's token counts must show up
+// on /healthz without parsing logs.
+func TestHealthzReportsUsageAfterATurn(t *testing.T) {
+	cfg := &config.Config{
+		AllowedOrigins: []string{"https://barrahome.org"},
+		MaxTurns:       20,
+		MaxTokens:      256,
+		MaxToolRounds:  4,
+		SessionTTL:     30 * time.Minute,
+	}
+	deps := Deps{
+		Cfg:   cfg,
+		Tools: stubTools{},
+		Model: &stubModel{reply: "hola", usage: &moonshot.Usage{
+			PromptTokens: 100, CompletionTokens: 10, TotalTokens: 110, CachedTokens: 40,
+		}},
+		Sessions: session.NewStore(session.Config{TTL: cfg.SessionTTL, MaxTurns: cfg.MaxTurns}),
+		Limiter:  limits.NewLimiter(20, 10),
+	}
+	h := NewServer(deps)
+	post(t, h, "https://barrahome.org", `{"session_id":"session-0001","message":"hola"}`)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("healthz status = %d, want 200", rec.Code)
+	}
+	body := rec.Body.String()
+	for _, want := range []string{`"prompt_tokens":100`, `"completion_tokens":10`, `"cached_tokens":40`, `"turns":1`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("healthz body = %s, want it to contain %s", body, want)
+		}
 	}
 }

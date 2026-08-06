@@ -10,12 +10,14 @@ import (
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/bet0x/barrahome-2026-agent/internal/agentloop"
 	"github.com/bet0x/barrahome-2026-agent/internal/config"
 	"github.com/bet0x/barrahome-2026-agent/internal/limits"
+	"github.com/bet0x/barrahome-2026-agent/internal/moonshot"
 	"github.com/bet0x/barrahome-2026-agent/internal/session"
 )
 
@@ -26,6 +28,44 @@ type Deps struct {
 	Model    agentloop.Streamer
 	Sessions *session.Store
 	Limiter  *limits.Limiter
+	// Usage accumulates token counts for /healthz. NewServer creates one if
+	// left nil.
+	Usage *UsageTotals
+}
+
+// UsageTotals accumulates token counts across every completed turn, for
+// operational visibility on /healthz. It is process-local instrumentation,
+// not a metrics system: it resets on restart and is never persisted.
+type UsageTotals struct {
+	mu                                sync.Mutex
+	turns                             int64
+	prompt, completion, cached, total int64
+}
+
+// NewUsageTotals returns an empty accumulator.
+func NewUsageTotals() *UsageTotals { return &UsageTotals{} }
+
+// Add folds one turn's usage into the running totals.
+func (u *UsageTotals) Add(m moonshot.Usage) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.turns++
+	u.prompt += int64(m.PromptTokens)
+	u.completion += int64(m.CompletionTokens)
+	u.cached += int64(m.CachedTokens)
+	u.total += int64(m.TotalTokens)
+}
+
+func (u *UsageTotals) snapshot() map[string]int64 {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return map[string]int64{
+		"turns":             u.turns,
+		"prompt_tokens":     u.prompt,
+		"completion_tokens": u.completion,
+		"cached_tokens":     u.cached,
+		"total_tokens":      u.total,
+	}
 }
 
 type streamRequest struct {
@@ -48,10 +88,18 @@ var sessionIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
 // NewServer wires the routes. nginx terminates the public side and strips the
 // /ai-proxy/ prefix, so paths here are unprefixed.
 func NewServer(d Deps) http.Handler {
+	if d.Usage == nil {
+		d.Usage = NewUsageTotals()
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"ok":true}`)
+		body, err := json.Marshal(map[string]any{"ok": true, "usage": d.Usage.snapshot()})
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		w.Write(body)
 	})
 	mux.HandleFunc("/stream", d.handleStream)
 	return mux
@@ -147,6 +195,11 @@ func (d Deps) handleStream(w http.ResponseWriter, r *http.Request) {
 		Tools:         d.Tools,
 		MaxTokens:     d.Cfg.MaxTokens,
 		MaxToolRounds: d.Cfg.MaxToolRounds,
+		OnUsage: func(u moonshot.Usage) {
+			log.Printf("turn usage: prompt=%d (cached=%d uncached=%d) completion=%d total=%d",
+				u.PromptTokens, u.CachedTokens, u.PromptTokens-u.CachedTokens, u.CompletionTokens, u.TotalTokens)
+			d.Usage.Add(u)
+		},
 	}, sess.Messages, req.Message, func(e agentloop.Event) error {
 		return send(string(e.Kind), map[string]string{"text": e.Text})
 	})

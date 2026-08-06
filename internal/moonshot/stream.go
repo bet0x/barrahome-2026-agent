@@ -21,15 +21,18 @@ const (
 
 // Client calls Moonshot's OpenAI-compatible chat-completions endpoint.
 type Client struct {
-	baseURL string
-	apiKey  string
-	model   string
-	hc      *http.Client
+	baseURL         string
+	apiKey          string
+	model           string
+	thinking        string // "enabled", "disabled", or "" to omit the field
+	reasoningEffort string // "low", "high", "max", or "" to omit the field
+	hc              *http.Client
 }
 
 // NewClient returns a client. hc may be nil, in which case http.DefaultClient
-// is used.
-func NewClient(baseURL, apiKey, model string, hc *http.Client) *Client {
+// is used. thinking and reasoningEffort are sent verbatim when non-empty;
+// config.Load decides which one (if either) applies to the chosen model.
+func NewClient(baseURL, apiKey, model, thinking, reasoningEffort string, hc *http.Client) *Client {
 	if hc == nil {
 		hc = http.DefaultClient
 	}
@@ -40,23 +43,55 @@ func NewClient(baseURL, apiKey, model string, hc *http.Client) *Client {
 		model = DefaultModel
 	}
 	return &Client{
-		baseURL: strings.TrimRight(baseURL, "/"),
-		apiKey:  apiKey,
-		model:   model,
-		hc:      hc,
+		baseURL:         strings.TrimRight(baseURL, "/"),
+		apiKey:          apiKey,
+		model:           model,
+		thinking:        thinking,
+		reasoningEffort: reasoningEffort,
+		hc:              hc,
 	}
 }
 
 type chatRequest struct {
-	Model     string    `json:"model"`
-	Messages  []Message `json:"messages"`
-	Tools     []ToolDef `json:"tools,omitempty"`
-	Stream    bool      `json:"stream"`
-	MaxTokens int       `json:"max_tokens,omitempty"`
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Tools    []ToolDef `json:"tools,omitempty"`
+	Stream   bool      `json:"stream"`
+	// MaxCompletionTokens caps the reply's length, not prompt+reply: max_tokens
+	// is deprecated in favor of this field.
+	MaxCompletionTokens int             `json:"max_completion_tokens,omitempty"`
+	Thinking            *thinkingOption `json:"thinking,omitempty"`
+	ReasoningEffort     string          `json:"reasoning_effort,omitempty"`
+	StreamOptions       *streamOptions  `json:"stream_options,omitempty"`
+}
+
+// thinkingOption controls kimi-k2.6's extended thinking. Keep is left unset
+// (defaults to null upstream); we have no use yet for retaining transcripts.
+type thinkingOption struct {
+	Type string `json:"type"`
+}
+
+// streamOptions requests the trailing usage chunk on a streamed response.
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+// rawUsage mirrors the wire shape of a usage object. CachedTokens rides
+// under prompt_tokens_details, per Moonshot's documented cache accounting.
+type rawUsage struct {
+	PromptTokens        int `json:"prompt_tokens"`
+	CompletionTokens    int `json:"completion_tokens"`
+	TotalTokens         int `json:"total_tokens"`
+	PromptTokensDetails struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
 }
 
 // streamChunk mirrors one SSE payload. tool_calls arrive in fragments keyed by
-// index, so arguments must be concatenated across chunks.
+// index, so arguments must be concatenated across chunks. Usage can arrive
+// two ways: as a trailing chunk with empty choices (the documented shape for
+// stream_options.include_usage), or nested in a choice alongside its
+// finish_reason (observed from the live API). Both are read defensively.
 type streamChunk struct {
 	Choices []struct {
 		Delta struct {
@@ -72,8 +107,10 @@ type streamChunk struct {
 				} `json:"function"`
 			} `json:"tool_calls"`
 		} `json:"delta"`
-		FinishReason string `json:"finish_reason"`
+		FinishReason string    `json:"finish_reason"`
+		Usage        *rawUsage `json:"usage"`
 	} `json:"choices"`
+	Usage *rawUsage `json:"usage"`
 }
 
 // Stream sends msgs upstream and consumes the SSE response. Text deltas are
@@ -86,13 +123,21 @@ func (c *Client) Stream(
 	maxTokens int,
 	onText func(string) error,
 ) (*Message, error) {
-	body, err := json.Marshal(chatRequest{
-		Model:     c.model,
-		Messages:  msgs,
-		Tools:     tools,
-		Stream:    true,
-		MaxTokens: maxTokens,
-	})
+	reqBody := chatRequest{
+		Model:               c.model,
+		Messages:            msgs,
+		Tools:               tools,
+		Stream:              true,
+		MaxCompletionTokens: maxTokens,
+		StreamOptions:       &streamOptions{IncludeUsage: true},
+	}
+	if c.thinking != "" {
+		reqBody.Thinking = &thinkingOption{Type: c.thinking}
+	}
+	if c.reasoningEffort != "" {
+		reqBody.ReasoningEffort = c.reasoningEffort
+	}
+	body, err := json.Marshal(reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("moonshot: encoding request: %w", err)
 	}
@@ -128,6 +173,7 @@ func (c *Client) Stream(
 	partials := map[int]*partialCall{}
 	sawDone := false
 	finishReason := ""
+	var usage *rawUsage
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -148,6 +194,11 @@ func (c *Client) Stream(
 		if err := json.Unmarshal([]byte(payload), &chunk); err != nil {
 			continue // tolerate keep-alives and non-JSON comments
 		}
+		// The usage-only trailing chunk has an empty choices array, so this
+		// must be read before the choices-empty skip below discards it.
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
 		if len(chunk.Choices) == 0 {
 			continue
 		}
@@ -156,6 +207,9 @@ func (c *Client) Stream(
 		choice := chunk.Choices[0]
 		if choice.FinishReason != "" {
 			finishReason = choice.FinishReason
+		}
+		if choice.Usage != nil {
+			usage = choice.Usage
 		}
 		if choice.Delta.Content != "" {
 			text.WriteString(choice.Delta.Content)
@@ -192,6 +246,14 @@ func (c *Client) Stream(
 
 	out.Content = text.String()
 	out.FinishReason = finishReason
+	if usage != nil {
+		out.Usage = &Usage{
+			PromptTokens:     usage.PromptTokens,
+			CompletionTokens: usage.CompletionTokens,
+			TotalTokens:      usage.TotalTokens,
+			CachedTokens:     usage.PromptTokensDetails.CachedTokens,
+		}
+	}
 
 	indexes := make([]int, 0, len(partials))
 	for i := range partials {

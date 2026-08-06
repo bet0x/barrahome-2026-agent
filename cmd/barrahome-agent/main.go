@@ -152,9 +152,10 @@ func serve() error {
 	limiter.StartSweeper(5*time.Minute, stop)
 
 	handler := httpapi.NewServer(httpapi.Deps{
-		Cfg:      cfg,
-		Tools:    content.NewTools(resolver),
-		Model:    moonshot.NewClient(cfg.MoonshotBaseURL, cfg.MoonshotAPIKey, cfg.Model, &http.Client{Timeout: 120 * time.Second}),
+		Cfg:   cfg,
+		Tools: content.NewTools(resolver),
+		Model: moonshot.NewClient(cfg.MoonshotBaseURL, cfg.MoonshotAPIKey, cfg.Model,
+			cfg.Thinking, cfg.ReasoningEffort, &http.Client{Timeout: 120 * time.Second}),
 		Sessions: sessions,
 		Limiter:  limiter,
 	})

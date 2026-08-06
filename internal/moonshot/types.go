@@ -16,6 +16,21 @@ type Message struct {
 	// "length", "tool_calls"). Stream sets it on the message it returns;
 	// it is never sent upstream, so it stays out of the wire format.
 	FinishReason string `json:"-"`
+
+	// Usage reports the token cost of the request/response cycle that
+	// produced this message. Stream sets it only when the upstream actually
+	// reported usage; nil means unknown, not zero. Never sent upstream.
+	Usage *Usage `json:"-"`
+}
+
+// Usage is the token accounting for one API call. CachedTokens is the subset
+// of PromptTokens served from Moonshot's automatic prefix cache, billed at a
+// fraction of the uncached rate.
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	CachedTokens     int
 }
 
 // ToolCall is a function call the model asked for.

@@ -185,15 +185,18 @@ Everything is environment-driven. Only `MOONSHOT_API_KEY` is required.
 | `MOONSHOT_API_KEY` | — | Required |
 | `MOONSHOT_BASE_URL` | `https://api.moonshot.ai/v1` | |
 | `MOONSHOT_MODEL` | `kimi-k2.6` | |
+| `MOONSHOT_THINKING` | `disabled` on kimi-k2.x | `enabled`/`disabled`; ignored (with a startup warning) on models other than kimi-k2.x |
+| `MOONSHOT_REASONING_EFFORT` | unset | `low`/`high`/`max`; applies to kimi-k3 only, ignored (with a startup warning) otherwise |
 | `BARRAHOME_WORKSPACE` | `/workspace` | The only readable content directory |
 | `BARRAHOME_PORT` | `9000` | |
 | `BARRAHOME_ALLOWED_ORIGINS` | `https://barrahome.org,https://www.barrahome.org` | Comma-separated, matched exactly |
 | `BARRAHOME_MAX_TURNS` | `20` | Per session |
-| `BARRAHOME_MAX_TOKENS` | `1024` | Per response |
-| `BARRAHOME_MAX_TOOL_ROUNDS` | `4` | Bounds the agent loop |
+| `BARRAHOME_MAX_TOKENS` | `1024` | Per response; sent upstream as `max_completion_tokens`, not the deprecated `max_tokens` |
+| `BARRAHOME_MAX_TOOL_ROUNDS` | `3` | Bounds the agent loop; the round after this one gets a tools-less call forced to a prose answer rather than an error |
 | `BARRAHOME_SESSION_TTL_MIN` | `30` | Idle sessions are swept |
 | `BARRAHOME_PER_IP_PER_HOUR` | `20` | The main cost control |
 | `BARRAHOME_MAX_CONCURRENT` | `10` | Simultaneous upstream streams; excess is refused, never queued |
+| `BARRAHOME_SHUTDOWN_TIMEOUT_SEC` | `30` | How long `serve` waits for in-flight streams to drain on shutdown; `compose.yaml`'s `stop_grace_period` must stay comfortably above it |
 
 ## Tests
 

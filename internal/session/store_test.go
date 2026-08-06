@@ -73,6 +73,66 @@ func TestCheckoutRefusesConcurrentSameSession(t *testing.T) {
 	release2()
 }
 
+// TestErrorPathsReturnUsableRelease guards the "defer release()" idiom: a
+// caller that writes it immediately after Checkout, before checking err,
+// must not panic on the ErrSessionBusy or ErrTurnLimit paths.
+func TestErrorPathsReturnUsableRelease(t *testing.T) {
+	st := NewStore(30*time.Minute, 1)
+	now := time.Now()
+
+	_, release, err := st.Checkout("abc", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, busyRelease, err := st.Checkout("abc", now)
+	if !errors.Is(err, ErrSessionBusy) {
+		t.Fatalf("err = %v, want ErrSessionBusy", err)
+	}
+	if busyRelease == nil {
+		t.Fatal("release func on the ErrSessionBusy path is nil")
+	}
+	busyRelease() // must not panic
+
+	release() // maxTurns is 1: this was the only turn, and it's spent now.
+
+	_, limitRelease, err := st.Checkout("abc", now)
+	if !errors.Is(err, ErrTurnLimit) {
+		t.Fatalf("err = %v, want ErrTurnLimit", err)
+	}
+	if limitRelease == nil {
+		t.Fatal("release func on the ErrTurnLimit path is nil")
+	}
+	limitRelease() // must not panic
+}
+
+// TestReleaseIsIdempotent reproduces the round-2 bug: a caller that calls
+// its release func twice must not clear a later holder's checkedOut flag
+// out from under it. Without idempotency, the second call here would free
+// "abc" for a third party while B still believes it holds it exclusively.
+func TestReleaseIsIdempotent(t *testing.T) {
+	st := NewStore(30*time.Minute, 20)
+	now := time.Now()
+
+	_, releaseA, err := st.Checkout("abc", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	releaseA()
+
+	_, releaseB, err := st.Checkout("abc", now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseB()
+
+	releaseA() // stale double release, must be a no-op now
+
+	if _, _, err := st.Checkout("abc", now); !errors.Is(err, ErrSessionBusy) {
+		t.Errorf("checkout while B still holds it = %v, want ErrSessionBusy (A's double release broke exclusivity)", err)
+	}
+}
+
 // TestConcurrentCheckoutRespectsTurnCap reproduces the reviewer's race
 // (many goroutines hammering one session id under a low turn cap) against
 // the new API: each goroutine retries on ErrSessionBusy and stops on
@@ -85,13 +145,18 @@ func TestConcurrentCheckoutRespectsTurnCap(t *testing.T) {
 	st := NewStore(30*time.Minute, maxTurns)
 	now := time.Now()
 
+	// Bounded, not "for {}": if a regression ever makes release stop
+	// freeing the session, this fails fast with a message instead of
+	// hanging until the test binary's own timeout.
+	const maxAttempts = 100_000
+
 	var successes atomic.Int64
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for {
+			for attempt := 0; attempt < maxAttempts; attempt++ {
 				sess, release, err := st.Checkout("shared", now)
 				switch {
 				case errors.Is(err, ErrSessionBusy):
@@ -107,6 +172,7 @@ func TestConcurrentCheckoutRespectsTurnCap(t *testing.T) {
 				successes.Add(1)
 				return
 			}
+			t.Errorf("gave up after %d attempts waiting for %q to free up", maxAttempts, "shared")
 		}()
 	}
 	wg.Wait()
@@ -116,18 +182,23 @@ func TestConcurrentCheckoutRespectsTurnCap(t *testing.T) {
 	}
 }
 
-func TestSweepSkipsCheckedOutSession(t *testing.T) {
-	st := NewStore(30*time.Minute, 20)
+// TestSweepSkipsRecentCheckedOutSession uses a ttl shorter than
+// CheckoutDeadline so the two exemptions don't overlap: LastSeen alone
+// would make this session look idle past the ttl, but a live, recent
+// checkout must still protect it from Sweep. Once released, the same
+// idle-past-ttl check evicts it normally.
+func TestSweepSkipsRecentCheckedOutSession(t *testing.T) {
+	st := NewStore(1*time.Minute, 20)
 	now := time.Now()
-	stale := now.Add(-31 * time.Minute)
 
-	_, release, err := st.Checkout("stale", stale)
+	_, release, err := st.Checkout("busy", now)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if removed := st.Sweep(now); removed != 0 {
-		t.Errorf("Sweep removed %d checked-out sessions, want 0", removed)
+	later := now.Add(2 * time.Minute) // past the 1-minute ttl, well under CheckoutDeadline
+	if removed := st.Sweep(later); removed != 0 {
+		t.Errorf("Sweep removed %d for a live, non-stuck checkout, want 0", removed)
 	}
 	if st.Len() != 1 {
 		t.Errorf("Len() = %d, want 1 while checked out", st.Len())
@@ -135,11 +206,61 @@ func TestSweepSkipsCheckedOutSession(t *testing.T) {
 
 	release()
 
-	if removed := st.Sweep(now); removed != 1 {
+	if removed := st.Sweep(later); removed != 1 {
 		t.Errorf("Sweep removed %d after release, want 1", removed)
 	}
 	if st.Len() != 0 {
 		t.Errorf("Len() = %d after sweep, want 0", st.Len())
+	}
+}
+
+// TestSweepForceEvictsStuckCheckout covers the leak this round closes: a
+// checkout that is never released (a caller stuck on a slow upstream read,
+// say) must still age out once it has outstayed CheckoutDeadline, rather
+// than bricking that session id forever. The ForcedEvictions counter is the
+// operator-visible signal that this path fired.
+func TestSweepForceEvictsStuckCheckout(t *testing.T) {
+	st := NewStore(30*time.Minute, 20)
+	t0 := time.Now()
+
+	_, release1, err := st.Checkout("stuck", t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	past := t0.Add(CheckoutDeadline + time.Minute)
+	if removed := st.Sweep(past); removed != 1 {
+		t.Errorf("Sweep removed %d, want 1 (stuck checkout past deadline)", removed)
+	}
+	if st.Len() != 0 {
+		t.Errorf("Len() = %d after force-eviction, want 0", st.Len())
+	}
+	if got := st.ForcedEvictions(); got != 1 {
+		t.Errorf("ForcedEvictions() = %d, want 1", got)
+	}
+
+	// A new request for the same id must get a fresh session rather than
+	// ErrSessionBusy forever.
+	sess2, release2, err := st.Checkout("stuck", past)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess2.Messages = append(sess2.Messages, moonshot.Message{Role: "user", Content: "fresh"})
+	release2()
+
+	// The stuck caller's eventual, very late release must not disturb the
+	// session that has since taken its place — same guarantee as
+	// TestReleaseCannotResurrectEvictedSession, exercised via force-eviction
+	// instead of ttl-eviction.
+	release1()
+
+	sess3, release3, err := st.Checkout("stuck", past)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release3()
+	if len(sess3.Messages) != 1 || sess3.Messages[0].Content != "fresh" {
+		t.Errorf("force-eviction was undone by the stuck release: %+v", sess3.Messages)
 	}
 }
 

@@ -89,7 +89,7 @@ func post(t *testing.T, h http.Handler, origin, body string) *httptest.ResponseR
 
 func TestStreamHappyPath(t *testing.T) {
 	h := newTestServer(t, 20, 10)
-	rec := post(t, h, "https://barrahome.org", `{"session_id":"s1","message":"hola"}`)
+	rec := post(t, h, "https://barrahome.org", `{"session_id":"session-0001","message":"hola"}`)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
@@ -108,7 +108,7 @@ func TestStreamHappyPath(t *testing.T) {
 
 func TestStreamRejectsForeignOrigin(t *testing.T) {
 	h := newTestServer(t, 20, 10)
-	rec := post(t, h, "https://evil.example", `{"session_id":"s1","message":"hola"}`)
+	rec := post(t, h, "https://evil.example", `{"session_id":"session-0001","message":"hola"}`)
 	if rec.Code != http.StatusForbidden {
 		t.Errorf("status = %d, want 403", rec.Code)
 	}
@@ -123,8 +123,50 @@ func TestStreamRejectsBadRequests(t *testing.T) {
 	if rec := post(t, h, "https://barrahome.org", `{"session_id":"","message":"x"}`); rec.Code != http.StatusBadRequest {
 		t.Errorf("missing session_id status = %d, want 400", rec.Code)
 	}
-	if rec := post(t, h, "https://barrahome.org", `{"session_id":"s1","message":"   "}`); rec.Code != http.StatusBadRequest {
+	if rec := post(t, h, "https://barrahome.org", `{"session_id":"session-0001","message":"   "}`); rec.Code != http.StatusBadRequest {
 		t.Errorf("blank message status = %d, want 400", rec.Code)
+	}
+}
+
+// TestStreamRejectsMalformedSessionID pins the charset: anything outside
+// [A-Za-z0-9_-]{8,64} is refused, which is what keeps a newline out of the
+// server's log lines.
+func TestStreamRejectsMalformedSessionID(t *testing.T) {
+	cases := map[string]string{
+		"newline":       `{"session_id":"good-id-1\nfake log line","message":"x"}`,
+		"space":         `{"session_id":"good id 1","message":"x"}`,
+		"dot":           `{"session_id":"../../etc/passwd","message":"x"}`,
+		"too short":     `{"session_id":"short7c","message":"x"}`,
+		"too long":      `{"session_id":"` + strings.Repeat("a", 65) + `","message":"x"}`,
+		"unicode":       `{"session_id":"sesión-0001","message":"x"}`,
+		"percent":       `{"session_id":"sess%0d%0a01","message":"x"}`,
+		"null byte":     `{"session_id":"sess\u0000ion1","message":"x"}`,
+		"interior crlf": `{"session_id":"session\r\n0001","message":"x"}`,
+	}
+	h := newTestServer(t, 20, 10)
+	for name, body := range cases {
+		t.Run(name, func(t *testing.T) {
+			if rec := post(t, h, "https://barrahome.org", body); rec.Code != http.StatusBadRequest {
+				t.Errorf("status = %d, want 400 (body %s)", rec.Code, body)
+			}
+		})
+	}
+}
+
+// TestStreamCountsMessageInRunes keeps the advertised 4000-character limit
+// honest for multi-byte text: 4000 CJK characters are ~12KB and must pass,
+// while 4001 must not.
+func TestStreamCountsMessageInRunes(t *testing.T) {
+	h := newTestServer(t, 20, 10)
+
+	body := `{"session_id":"runes-0001","message":"` + strings.Repeat("字", maxMessageRunes) + `"}`
+	if rec := post(t, h, "https://barrahome.org", body); rec.Code != http.StatusOK {
+		t.Errorf("4000 runes status = %d, want 200 (body %s)", rec.Code, rec.Body.String())
+	}
+
+	body = `{"session_id":"runes-0002","message":"` + strings.Repeat("字", maxMessageRunes+1) + `"}`
+	if rec := post(t, h, "https://barrahome.org", body); rec.Code != http.StatusBadRequest {
+		t.Errorf("4001 runes status = %d, want 400", rec.Code)
 	}
 }
 
@@ -216,10 +258,10 @@ func TestStreamQuotaSurvivesForgedForwardedFor(t *testing.T) {
 
 func TestStreamEnforcesPerIPQuota(t *testing.T) {
 	h := newTestServer(t, 1, 10)
-	if rec := post(t, h, "https://barrahome.org", `{"session_id":"s1","message":"one"}`); rec.Code != http.StatusOK {
+	if rec := post(t, h, "https://barrahome.org", `{"session_id":"session-0001","message":"one"}`); rec.Code != http.StatusOK {
 		t.Fatalf("first request status = %d", rec.Code)
 	}
-	rec := post(t, h, "https://barrahome.org", `{"session_id":"s2","message":"two"}`)
+	rec := post(t, h, "https://barrahome.org", `{"session_id":"session-0002","message":"two"}`)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Errorf("second request status = %d, want 429", rec.Code)
 	}
@@ -239,7 +281,7 @@ func TestStreamRejectsConcurrentSameSession(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		firstRec = post(t, h, "https://barrahome.org", `{"session_id":"busy","message":"one"}`)
+		firstRec = post(t, h, "https://barrahome.org", `{"session_id":"busy-session-1","message":"one"}`)
 	}()
 
 	select {
@@ -248,7 +290,7 @@ func TestStreamRejectsConcurrentSameSession(t *testing.T) {
 		t.Fatal("first request never reached the model")
 	}
 
-	rec := post(t, h, "https://barrahome.org", `{"session_id":"busy","message":"two"}`)
+	rec := post(t, h, "https://barrahome.org", `{"session_id":"busy-session-1","message":"two"}`)
 	if rec.Code != http.StatusConflict {
 		t.Errorf("concurrent request status = %d, want 409", rec.Code)
 	}

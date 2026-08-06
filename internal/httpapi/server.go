@@ -115,18 +115,20 @@ func (d Deps) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The Flusher check comes before any header is written, so its failure can
+	// still be a status code.
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
 	// Past this point the response is a stream, so failures are SSE events
 	// rather than status codes.
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
-
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
-		return
-	}
 
 	send := func(event string, payload any) error {
 		body, err := json.Marshal(payload)

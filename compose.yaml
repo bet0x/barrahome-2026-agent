@@ -1,8 +1,14 @@
-# Local development stack. seccomp=unconfined is mandatory: with Docker's
-# default profile sandlock cannot create a sandbox at all (verified on both the
-# dev machine and the VPS). Namespaces, dropped capabilities, the read-only
-# rootfs and cgroup limits all remain in force, and sandlock applies its own
-# syscall filter to the worker.
+# Local development stack. The container keeps Docker's default seccomp profile
+# and holds CAP_SYS_PTRACE, which is what that profile requires before it will
+# permit pidfd_getfd (moby#45622) — the syscall the supervisor uses to duplicate
+# the worker's descriptors. Without the capability sandlock cannot create a
+# sandbox at all and the supervisor exits instead of serving unconfined.
+#
+# Do not replace this with seccomp=unconfined. That was the workaround here
+# until 2026/09 and it gives up Docker's whole syscall filter to buy nothing:
+# the capability alone is enough. The worker does not get to keep the
+# privilege — sandlock's default blocklist denies the child ptrace and
+# process_vm_readv/writev, and internal/sandbox adds pidfd_getfd.
 services:
   agent:
     image: barrahome-agent:dev
@@ -27,9 +33,10 @@ services:
       - /tmp
     cap_drop:
       - ALL
+    cap_add:
+      - SYS_PTRACE
     security_opt:
       - no-new-privileges:true
-      - seccomp=unconfined
     mem_limit: 512m
     pids_limit: 128
     # Must exceed the supervisor's worker-kill grace (BARRAHOME_SHUTDOWN_TIMEOUT_SEC

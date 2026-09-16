@@ -17,11 +17,18 @@ const MoonshotHostPort = "api.moonshot.ai:443"
 type Options struct {
 	Workspace  string // absolute path to the read-only content directory
 	ListenPort int
-	// MaxMemory is a sandlock byte-size ("64M"); "" leaves it unset. It is
-	// enforced by summing the length of every anonymous mmap, which a Go
-	// child cannot survive: the runtime reserves its heap arenas up front, so
-	// any limit smaller than that reservation kills the process at startup.
-	// Leave it unset for Go children and cap their memory with a cgroup.
+	// MaxMemory is a sandlock byte-size ("64M"); "" leaves it unset. The
+	// worker leaves it unset and lets the cgroup cap memory instead, because
+	// a cgroup counts resident set size while sandlock counts mapped length,
+	// and RSS is the thing we mean.
+	//
+	// Until sandlock v0.8.8 that was not a preference. The accounting summed
+	// the length of every anonymous mmap, including the large PROT_NONE arena
+	// the Go runtime reserves at startup, so any limit small enough to be
+	// useful killed the worker before main ran. v0.8.8 stopped charging
+	// PROT_NONE reservations and a Go child now survives a real limit. This
+	// checkout is pinned below that (third_party/sandlock), so here the old
+	// behaviour still applies and the field must stay empty for the worker.
 	MaxMemory    string
 	MaxProcesses uint32
 	MaxOpenFiles uint32
@@ -46,13 +53,21 @@ func Policy(opts Options) *sandlock.Sandbox {
 			"/etc/hosts",
 			"/etc/resolv.conf",
 		},
-		NetAllow:     []string{MoonshotHostPort},
-		NetAllowBind: []string{fmt.Sprintf("%d", opts.ListenPort)},
-		MaxMemory:    opts.MaxMemory,
-		MaxProcesses: opts.MaxProcesses,
-		MaxOpenFiles: opts.MaxOpenFiles,
-		MaxCPU:       opts.MaxCPU,
-		Name:         "barrahome-agent",
+		NetAllow: []string{MoonshotHostPort},
+		// The container holds CAP_SYS_PTRACE so the supervisor can call
+		// pidfd_getfd under Docker's default seccomp profile (see
+		// compose.yaml), and the worker inherits the capability. sandlock's
+		// default blocklist already denies the child ptrace and
+		// process_vm_readv/writev; pidfd_getfd is the one syscall that
+		// capability unlocks that it does not cover, and the worker has no
+		// use for it.
+		ExtraDenySyscalls: []string{"pidfd_getfd"},
+		NetAllowBind:      []string{fmt.Sprintf("%d", opts.ListenPort)},
+		MaxMemory:         opts.MaxMemory,
+		MaxProcesses:      opts.MaxProcesses,
+		MaxOpenFiles:      opts.MaxOpenFiles,
+		MaxCPU:            opts.MaxCPU,
+		Name:              "barrahome-agent",
 	}
 }
 

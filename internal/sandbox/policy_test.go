@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -159,5 +160,39 @@ func TestPolicyEnforcesMemoryLimit(t *testing.T) {
 	}
 	if res.ExitCode == 0 {
 		t.Errorf("256MB allocation should fail under MaxMemory=64M, got exit=0 stdout=%q", res.Stdout)
+	}
+}
+
+// TestPolicyEnforcesBindAllowlist guards NetAllowBind, which sandlock silently
+// stopped enforcing whenever NetAllow was also set (our exact combination)
+// until the fix in v0.8.8. The worker binds one port and nothing else in the
+// process listens, so the practical exposure was nil, but a control that stops
+// enforcing without saying so is worth a test rather than trust.
+func TestPolicyEnforcesBindAllowlist(t *testing.T) {
+	opts := testOptions(t, t.TempDir())
+	// Not the worker's real port: the dev container publishes that on the
+	// host, and EADDRINUSE would be indistinguishable from a refused bind.
+	opts.ListenPort = 18080
+	sb := Policy(opts)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	bind := "import socket;s=socket.socket();s.bind(('127.0.0.1',%d));print('bound')"
+
+	res, err := sb.Run(ctx, "python3", "-c", fmt.Sprintf(bind, opts.ListenPort))
+	if err != nil {
+		t.Fatalf("running allowed bind: %v", err)
+	}
+	if res.ExitCode != 0 {
+		t.Errorf("the listen port must be bindable, got exit=%d stderr=%q", res.ExitCode, res.Stderr)
+	}
+
+	res, err = sb.Run(ctx, "python3", "-c", fmt.Sprintf(bind, 18099))
+	if err != nil {
+		t.Fatalf("running denied bind: %v", err)
+	}
+	if res.ExitCode == 0 {
+		t.Errorf("a port outside NetAllowBind must not be bindable, but bind succeeded: %q", res.Stdout)
 	}
 }

@@ -22,13 +22,14 @@ type Options struct {
 	// a cgroup counts resident set size while sandlock counts mapped length,
 	// and RSS is the thing we mean.
 	//
-	// Until sandlock v0.8.8 that was not a preference. The accounting summed
-	// the length of every anonymous mmap, including the large PROT_NONE arena
-	// the Go runtime reserves at startup, so any limit small enough to be
-	// useful killed the worker before main ran. v0.8.8 stopped charging
-	// PROT_NONE reservations and a Go child now survives a real limit. This
-	// checkout is pinned below that (third_party/sandlock), so here the old
-	// behaviour still applies and the field must stay empty for the worker.
+	// Until sandlock v0.8.8 that was not a preference but a necessity. The
+	// accounting charged every anonymous mmap by length, including the large
+	// PROT_NONE arena the Go runtime reserves at startup, so no limit small
+	// enough to be useful let the worker start at all. v0.8.8 stopped charging
+	// PROT_NONE reservations and the field works on a Go child now: measured
+	// on this submodule, a hello world runs under 64M and this package's own
+	// 2.9MB test binary runs under 128M and dies under 64M. It stays unset
+	// regardless, on the RSS argument above.
 	MaxMemory    string
 	MaxProcesses uint32
 	MaxOpenFiles uint32
@@ -42,8 +43,11 @@ type Options struct {
 // than granting /etc wholesale, which would expose /etc/shadow. There is no
 // FSWritable grant: sandlock bundles full read rights into any write grant,
 // so a blanket FSWritable("/tmp") would expose other processes' temp files.
-// NetAllowBind documents intent but isn't a control we rely on — sandlock
-// silently drops the bind allowlist whenever NetAllow is also set.
+// NetAllowBind is a control again as of sandlock v0.8.8. Before that it was
+// silently dropped whenever NetAllow was also set, which is exactly our
+// combination, so it documented intent and enforced nothing.
+// TestPolicyEnforcesBindAllowlist pins the behaviour down: it passes on v0.8.8
+// and fails against the pin this repo carried until the bump.
 func Policy(opts Options) *sandlock.Sandbox {
 	return &sandlock.Sandbox{
 		FSReadable: []string{

@@ -3,12 +3,13 @@
 # The Go SDK links sandlock's C ABI through cgo, so CGO_ENABLED=0 is not an
 # option and the native library has to be built first.
 #
-# glibc, not musl: sandlock-core's ptrace() calls pass libc::c_uint request
-# constants, which only matches glibc's ptrace(request: c_int, ...) binding.
-# musl's binding takes a plain i32 and the vendored code fails to compile
-# against it (20 type errors, e.g. resource.rs:459). That's third-party code
-# in a pinned submodule, not something to patch here, so this build targets
-# glibc throughout; debian:trixie-slim also matches the VPS's glibc 2.41.
+# glibc, not musl. sandlock-core did not compile against musl at all until
+# v0.8.8 (the libc crate types the ptrace request as c_uint on glibc and c_int
+# on musl, among others), and now it does, so a small Alpine image is finally
+# possible. This build stays on glibc anyway: upstream publishes no musl target
+# in its release matrix, the FFI cdylib needs -C target-feature=-crt-static to
+# build for musl, and debian:trixie-slim matches the VPS's glibc 2.41, so the
+# binary tested locally is the binary that runs in production.
 FROM rust:1-bookworm AS ffi
 WORKDIR /src
 COPY third_party/sandlock/ ./third_party/sandlock/
